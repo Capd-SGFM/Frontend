@@ -5,6 +5,7 @@ import { BrowserRouter, Routes, Route } from "react-router-dom";
 import App from "./App";                 // 로그인 페이지
 import MainPage from "./pages/MainPage";
 import AdminPage from "./pages/AdminPage";
+import BacktestingPage from "./pages/Backtesting";
 import SignupPage from "./pages/SignupPage";
 import ProtectedRoute from "./components/ProtectedRoute";
 import "./index.css";
@@ -23,6 +24,7 @@ ReactDOM.createRoot(document.getElementById("root")!).render(
         <Route element={<ProtectedRoute />}>
           <Route path="/main" element={<MainPage />} />
           <Route path="/admin" element={<AdminPage />} />
+          <Route path="/backtesting" element={<BacktestingPage />} />
         </Route>
 
         {/* 404 */}

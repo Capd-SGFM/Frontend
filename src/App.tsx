@@ -167,7 +167,6 @@ export default function App() {
       {/* 공개 */}
       <Route path="/" element={<LoginPage />} />
       <Route path="/signup" element={<SignupPage />} />
-
       {/* 보호 */}
       <Route element={<ProtectedRoute />}>
         <Route path="/main" element={<MainPage />} />
