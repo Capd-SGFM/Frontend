@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="ko">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="icon" type="image/png" href="/favicon.png" />
+
+    <!-- 반응형 / 모바일 대응 -->
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+
+    <!-- TailwindCSS 폰트 (Poppins 예시) -->
+    <link
+      href="https://fonts.googleapis.com/css2?family=Poppins:wght@400;600;800&display=swap"
+      rel="stylesheet"
+    />
+
+    <!-- 사이트 제목: 환경 변수 기반으로 자동 표시 -->
+    <title>
+      <%= VITE_SERVICE_NAME || "capdbreak" %>
+    </title>
+
+    <!-- Open Graph (SNS 미리보기용) -->
+    <meta property="og:title" content="Finance Flow | AI 기반 트레이딩 플랫폼" />
+    <meta property="og:description" content="AI 알고리즘 기반 자산운용 시스템" />
+    <meta property="og:type" content="website" />
+    <meta property="og:image" content="/meta-preview.png" />
+    <meta property="og:url" content="https://localhost:5173" />
+
+    <!-- 색상 테마 -->
+    <meta name="theme-color" content="#0f172a" />
+  </head>
+
+  <body class="bg-slate-900 text-white min-h-screen">
+    <div id="root" class="min-h-screen"></div>
+
+    <!-- Vite React 엔트리 -->
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>
