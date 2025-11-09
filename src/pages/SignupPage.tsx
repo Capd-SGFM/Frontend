@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useMemo } from "react";
 import { useNavigate, useSearchParams } from "react-router-dom";
+import { useAuthCheck } from "../components/is_logined"; // 추가
 
-// 백엔드 URL
 const BACKEND_BASE_URL =
   import.meta.env.VITE_BACKEND_URL || "http://localhost:8080";
 
@@ -60,6 +60,7 @@ const CONSENT_TITLE_CLASS = "text-indigo-400 font-bold mb-2";
 const TOKEN_KEY = "jwt_token";
 
 const SignupPage: React.FC = () => {
+
   const navigate = useNavigate();
   const [searchParams, setSearchParams] = useSearchParams();
 

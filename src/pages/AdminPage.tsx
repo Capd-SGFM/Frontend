@@ -1,5 +1,7 @@
 import React, { useState, useRef, useEffect, useMemo } from "react";
 import axios from "axios";
+import { useAuthCheck } from "../components/is_logined";
+
 
 type CeleryState = "PENDING" | "PROGRESS" | "SUCCESS" | "FAILURE" | "STARTED" | "UNKNOWN";
 // DB 스키마에 정의된 모든 인터벌을 포함
@@ -66,6 +68,9 @@ const createEmptySymbolProgress = (symbol: string): SymbolProgress => ({
 });
 
 const AdminPage: React.FC = () => {
+  const { isChecking, isValid } = useAuthCheck();
+
+  
   const [registerMessage, setRegisterMessage] = useState("");
   const [loading, setLoading] = useState(false); // UI 로딩 (버튼 클릭 시)
   
@@ -325,6 +330,14 @@ const AdminPage: React.FC = () => {
   const scrollToTop = () => {
     listContainerRef.current?.scrollTo({ top: 0, behavior: "smooth" });
   };
+
+  if (isChecking)
+    return (
+      <div className="flex items-center justify-center w-screen h-screen bg-gray-900 text-white">
+        인증 확인 중...
+      </div>
+    );
+  if (!isValid) return null;
 
   return (
     <div className="flex flex-col items-center w-screen min-h-screen p-6 md:p-8 bg-gray-900 text-white">

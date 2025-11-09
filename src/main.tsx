@@ -2,7 +2,7 @@ import React from "react";
 import ReactDOM from "react-dom/client";
 import { BrowserRouter, Routes, Route } from "react-router-dom";
 
-import App from "./App";                 // 로그인 페이지
+import App from "./App";
 import MainPage from "./pages/MainPage";
 import AdminPage from "./pages/AdminPage";
 import BacktestingPage from "./pages/Backtesting";
@@ -14,20 +14,20 @@ ReactDOM.createRoot(document.getElementById("root")!).render(
   <React.StrictMode>
     <BrowserRouter>
       <Routes>
-        {/* 공개: 로그인 페이지 */}
+        {/* JWT 토큰이 유효할 경우 /main으로 redirect되도록 수정해야함 */}
         <Route path="/" element={<App />} />
 
-        {/* 공개: 회원가입(여기서 URL의 jwt_token을 먼저 저장) */}
+        {/* JWT있을때만 접근할지 다시 수정해야함 */}
         <Route path="/signup" element={<SignupPage />} />
 
-        {/* 보호: 로그인 필요 페이지들 */}
+        {/* JWT토큰이 유효할 경우에만 접근 */}
         <Route element={<ProtectedRoute />}>
           <Route path="/main" element={<MainPage />} />
           <Route path="/admin" element={<AdminPage />} />
           <Route path="/backtesting" element={<BacktestingPage />} />
         </Route>
 
-        {/* 404 */}
+        {/* 등록되지 않은 경로로 접근 */}
         <Route
           path="*"
           element={

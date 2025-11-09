@@ -1,5 +1,4 @@
 import React, { useEffect } from "react";
-// Routes, Route, useNavigate 외에 Navigate, Outlet, useSearchParams 추가
 import {
   Routes,
   Route,
@@ -8,7 +7,6 @@ import {
   Outlet,
   useSearchParams,
 } from "react-router-dom";
-// SignupPage는 별도 파일로 관리한다고 가정 (예: ./pages/SignupPage.tsx)
 import SignupPage from "./pages/SignupPage";
 
 // --- 환경 변수 ---
@@ -160,7 +158,6 @@ const PublicRoute = () => {
   return isAuthenticated ? <Navigate to="/main" replace /> : <Outlet />;
 };
 
-// --- 메인 App 컴포넌트 ---
 export default function App() {
   return (
     <Routes>
