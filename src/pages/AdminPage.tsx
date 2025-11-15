@@ -50,7 +50,16 @@ const clampPct = (v: any) => {
 // (심볼에 속한 모든 인터벌 진행률의 평균을 계산)
 function computeOverallPct(p: SymbolProgress): number {
   const percentages = INTERVAL_ORDER
-    .map((intv) => p.intervals[intv]?.pct_time)
+    .map((intv) => {
+      const iv = p.intervals[intv];
+      if (!iv) return undefined;
+
+      // ★ SUCCESS인데 pct_time이 0/99 등으로 덜 올라온 경우 100으로 보정해서 평균 계산
+      if (iv.state === "SUCCESS" && (!iv.pct_time || iv.pct_time < 100)) {
+        return 100;
+      }
+      return iv.pct_time;
+    })
     .filter((pct) => typeof pct === "number") as number[];
 
   if (percentages.length === 0) return 0;
@@ -140,10 +149,18 @@ const AdminPage: React.FC = () => {
           const meta = item.meta || {};
           const prevInterval = next[symbol].intervals[interval];
 
+          const state = item.state as CeleryState;
+          let pctTime = clampPct(meta.pct ?? prevInterval?.pct_time ?? 0);
+
+          // ★ state가 SUCCESS이면 진행률은 무조건 100%로 보정
+          if (state === "SUCCESS" && pctTime < 100) {
+            pctTime = 100;
+          }
+
           next[symbol].intervals[interval] = {
             interval: interval,
-            state: item.state as CeleryState,
-            pct_time: clampPct(meta.pct ?? prevInterval?.pct_time ?? 0),
+            state,
+            pct_time: pctTime,
             last_updated_iso: meta.last_candle_time ?? prevInterval?.last_updated_iso ?? null,
           };
         }
@@ -333,7 +350,10 @@ const AdminPage: React.FC = () => {
   );
 
   const scrollToBottom = () => {
-    listContainerRef.current?.scrollTo({ top: listContainerRef.current.scrollHeight, behavior: "smooth" });
+    listContainerRef.current?.scrollTo({
+      top: listContainerRef.current.scrollHeight,
+      behavior: "smooth",
+    });
   };
   const scrollToTop = () => {
     listContainerRef.current?.scrollTo({ top: 0, behavior: "smooth" });
@@ -399,10 +419,7 @@ const AdminPage: React.FC = () => {
 
             <div className="flex-1" />
             <div className="flex gap-2">
-              <button
-                onClick={scrollToTop}
-                className="px-3 py-2 rounded-md bg-gray-700 hover:bg-gray-600 text-xs"
-              >
+              <button onClick={scrollToTop} className="px-3 py-2 rounded-md bg-gray-700 hover:bg-gray-600 text-xs">
                 맨 위로
               </button>
               <button
@@ -416,7 +433,7 @@ const AdminPage: React.FC = () => {
         </div>
 
         {/* 진행률 표시 */}
-        <div ref={listContainerRef} className="px-4 md:px-6 pb-16 max-h-[70vh] overflow-y-auto">
+        <div ref={listContainerRef} className="px-4 md:px-6 pb-24 max-h-[calc(100vh-300px)] overflow-y-auto">
           {rows.length > 0 ? (
             <div className="mt-4 space-y-4">
               {rows.map(({ idx, symbol, p, overallPct }) => (
@@ -470,7 +487,12 @@ const AdminPage: React.FC = () => {
                   <div className="mt-3 grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-5 gap-3">
                     {INTERVAL_ORDER.map((iv) => {
                       const ivp = p.intervals[iv];
-                      const pct = Math.round(clampPct(ivp?.pct_time ?? 0));
+                      const basePct = ivp?.pct_time ?? 0;
+                      // ★ SUCCESS인데 100보다 작게 찍혀 있으면 표시만이라도 100으로 보정
+                      const pct =
+                        ivp && ivp.state === "SUCCESS" && basePct < 100
+                          ? 100
+                          : Math.round(clampPct(basePct));
 
                       let tag: string;
                       let tagColor: string;
