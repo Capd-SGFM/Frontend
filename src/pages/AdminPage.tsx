@@ -2,7 +2,6 @@ import React, { useState, useRef, useEffect, useMemo } from "react";
 import axios from "axios";
 import { useAuthCheck } from "../components/is_logined";
 
-
 type CeleryState = "PENDING" | "PROGRESS" | "SUCCESS" | "FAILURE" | "STARTED" | "UNKNOWN";
 // DB 스키마에 정의된 모든 인터벌을 포함
 type IntervalKey = "1m" | "3m" | "5m" | "15m" | "30m" | "1h" | "4h" | "1d" | "1w" | "1M";
@@ -19,6 +18,7 @@ interface TaskStatusResponse {
   state: string;
   meta: any;
 }
+
 // --- (UI 상태를 위한 타입) ---
 interface IntervalProgress {
   interval: IntervalKey;
@@ -50,11 +50,11 @@ const clampPct = (v: any) => {
 // (심볼에 속한 모든 인터벌 진행률의 평균을 계산)
 function computeOverallPct(p: SymbolProgress): number {
   const percentages = INTERVAL_ORDER
-      .map(intv => p.intervals[intv]?.pct_time)
-      .filter(pct => typeof pct === 'number') as number[];
-      
+    .map((intv) => p.intervals[intv]?.pct_time)
+    .filter((pct) => typeof pct === "number") as number[];
+
   if (percentages.length === 0) return 0;
-  
+
   const sum = percentages.reduce((a, b) => a + b, 0);
   return Math.round(sum / percentages.length);
 }
@@ -70,27 +70,31 @@ const createEmptySymbolProgress = (symbol: string): SymbolProgress => ({
 const AdminPage: React.FC = () => {
   const { isChecking, isValid } = useAuthCheck();
 
-  
   const [registerMessage, setRegisterMessage] = useState("");
   const [loading, setLoading] = useState(false); // UI 로딩 (버튼 클릭 시)
-  
+
   // UI 표시에 사용되는 메인 상태 (심볼 기준)
   const [progressMap, setProgressMap] = useState<Record<string, SymbolProgress>>({});
-  
+
   // Celery 작업 추적용 상태
   // (Task ID -> {심볼, 인터벌}) 매핑
-  const [taskMap, setTaskMap] = useState<Record<string, { symbol: string, interval: IntervalKey }>>({});
+  const [taskMap, setTaskMap] = useState<Record<string, { symbol: string; interval: IntervalKey }>>({});
+  // 최신 taskMap을 폴링 콜백에서도 보기 위한 ref
+  const taskMapRef = useRef<Record<string, { symbol: string; interval: IntervalKey }>>({});
+
   // (현재 실행/폴링 중인 모든 Task ID 목록)
   const [allTaskIds, setAllTaskIds] = useState<string[]>([]);
 
   const pollIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const listContainerRef = useRef<HTMLDivElement | null>(null);
 
+  // taskMap이 바뀔 때마다 ref도 최신값으로 동기화
+  useEffect(() => {
+    taskMapRef.current = taskMap;
+  }, [taskMap]);
+
   // "진행 중" 여부를 allTaskIds 기준으로 판단
-  const isBackfillRunning = useMemo(
-    () => allTaskIds.length > 0,
-    [allTaskIds]
-  );
+  const isBackfillRunning = useMemo(() => allTaskIds.length > 0, [allTaskIds]);
 
   const stopPolling = () => {
     if (pollIntervalRef.current) {
@@ -99,14 +103,104 @@ const AdminPage: React.FC = () => {
     }
   };
 
+  // 폴링 및 상태 업데이트 로직 (taskMapRef 사용)
+  const pollBulkStatuses = async (ids: string[]) => {
+    if (!ids.length) return;
+    try {
+      const responses = await Promise.allSettled(
+        ids.map((id) => api.get<TaskStatusResponse>(`/ohlcv/status/${id}`))
+      );
+
+      const items: TaskStatusResponse[] = [];
+      responses.forEach((res, idx) => {
+        const taskId = ids[idx];
+        if (res.status === "fulfilled") {
+          items.push(res.value.data);
+        } else {
+          console.error("status 요청 실패:", taskId, res.reason);
+        }
+      });
+
+      if (items.length === 0) {
+        // 한 번도 성공적으로 상태를 못 받았으면 여기서 그냥 리턴 (다음 폴링 시도)
+        return;
+      }
+
+      setProgressMap((prev) => {
+        const next: Record<string, SymbolProgress> = JSON.parse(JSON.stringify(prev));
+
+        // 1. 개별 인터벌 상태 업데이트
+        for (const item of items) {
+          const taskInfo = taskMapRef.current[item.task_id]; // ★ 항상 최신 taskMap 사용
+          if (!taskInfo) continue;
+
+          const { symbol, interval } = taskInfo;
+          if (!next[symbol]) continue;
+
+          const meta = item.meta || {};
+          const prevInterval = next[symbol].intervals[interval];
+
+          next[symbol].intervals[interval] = {
+            interval: interval,
+            state: item.state as CeleryState,
+            pct_time: clampPct(meta.pct ?? prevInterval?.pct_time ?? 0),
+            last_updated_iso: meta.last_candle_time ?? prevInterval?.last_updated_iso ?? null,
+          };
+        }
+
+        // 2. 전체 심볼 상태 재계산
+        for (const symbol in next) {
+          const symbolProgress = next[symbol];
+          const symbolIntervals = INTERVAL_ORDER.map((intv) => symbolProgress.intervals[intv]).filter(
+            Boolean
+          ) as IntervalProgress[]; // 이 심볼에 할당된 모든 인터벌 작업
+
+          if (symbolIntervals.length === 0) {
+            // 이 심볼에 대해 시작된 작업이 없음
+            symbolProgress.state = "UNKNOWN"; // 혹은 'PENDING'
+            symbolProgress.status = "수집 대기 중";
+            continue;
+          }
+
+          if (symbolIntervals.some((iv) => iv.state === "FAILURE")) {
+            symbolProgress.state = "FAILURE";
+            symbolProgress.status = "하나 이상의 인터벌 수집 실패";
+          } else if (symbolIntervals.every((iv) => iv.state === "SUCCESS")) {
+            symbolProgress.state = "SUCCESS";
+            symbolProgress.status = "모든 인터벌 수집 완료";
+          } else if (symbolIntervals.some((iv) => iv.state === "PROGRESS" || iv.state === "STARTED")) {
+            symbolProgress.state = "PROGRESS";
+            symbolProgress.status = "데이터 수집 중...";
+          } else if (symbolIntervals.every((iv) => iv.state === "PENDING")) {
+            symbolProgress.state = "PENDING";
+            symbolProgress.status = "작업 대기 중...";
+          }
+        }
+
+        return next;
+      });
+
+      // 모든 작업이 완료(SUCCESS 또는 FAILURE)되었는지 확인
+      const allDone =
+        items.length > 0 && items.every((it) => ["SUCCESS", "FAILURE"].includes(it.state));
+      if (allDone) {
+        stopPolling();
+        setAllTaskIds([]);
+        setTaskMap({});
+      }
+    } catch (err) {
+      console.error("벌크 상태 폴링 오류:", err);
+    }
+  };
+
   // 폴링 시작 로직 (task ID 목록만 받음)
   const startPolling = (ids: string[]) => {
     stopPolling();
     if (!ids.length) return;
-    
+
     // 즉시 1회 실행
-    void pollBulkStatuses(ids); 
-    
+    void pollBulkStatuses(ids);
+
     // 인터벌 설정
     pollIntervalRef.current = setInterval(() => {
       // 화면이 보일 때만 폴링
@@ -114,7 +208,7 @@ const AdminPage: React.FC = () => {
     }, POLLING_INTERVAL);
   };
 
-  // "1. 종목 정보 갱신" (변경 없음)
+  // "1. 종목 정보 갱신"
   const handleRegisterSymbols = async () => {
     if (isBackfillRunning) return;
     setLoading(true);
@@ -134,7 +228,7 @@ const AdminPage: React.FC = () => {
   const handleStartCollection = async () => {
     if (isBackfillRunning) return;
     setLoading(true);
-    
+
     // 상태 초기화
     setProgressMap({});
     setTaskMap({});
@@ -149,22 +243,22 @@ const AdminPage: React.FC = () => {
       if (!symbolsToFetch || symbolsToFetch.length === 0) {
         throw new Error("서버에서 조회된 심볼이 없습니다. '종목 정보 갱신'을 먼저 실행하세요.");
       }
-      
-      const intervalsToFetch = [...INTERVAL_ORDER]; // 모든 인터벌
-      
-      // 새 백엔드 엔드포인트 호출 (Body가 비어있음)
-      const res = await api.post(`/ohlcv/backfill`, {});
 
+      const intervalsToFetch = [...INTERVAL_ORDER]; // (현재는 사용 안 하지만 향후 확장 대비)
+
+      // 백엔드 엔드포인트 호출 (Body가 비어있음)
+      const res = await api.post(`/ohlcv/backfill`, {});
       const { tasks } = (res.data || {}) as { tasks: TaskInfo[] };
+
       if (!tasks || tasks.length === 0) throw new Error("백엔드에서 작업을 생성하지 못했습니다.");
 
       const newProgressMap: Record<string, SymbolProgress> = {};
-      const newTaskMap: Record<string, { symbol: string, interval: IntervalKey }> = {};
+      const newTaskMap: Record<string, { symbol: string; interval: IntervalKey }> = {};
       const newTaskIds: string[] = [];
 
       // UI에 모든 심볼을 먼저 표시
       for (const symbol of symbolsToFetch) {
-          newProgressMap[symbol] = createEmptySymbolProgress(symbol);
+        newProgressMap[symbol] = createEmptySymbolProgress(symbol);
       }
 
       // 백엔드에서 받은 실제 작업 정보로 상태 업데이트
@@ -172,7 +266,7 @@ const AdminPage: React.FC = () => {
         newTaskIds.push(task.task_id);
         const intervalKey = task.interval as IntervalKey;
         newTaskMap[task.task_id] = { symbol: task.symbol, interval: intervalKey };
-        
+
         // 해당 심볼의 인터벌에 "PENDING" 상태 추가
         newProgressMap[task.symbol].intervals[intervalKey] = {
           interval: intervalKey,
@@ -184,10 +278,9 @@ const AdminPage: React.FC = () => {
       setProgressMap(newProgressMap);
       setTaskMap(newTaskMap);
       setAllTaskIds(newTaskIds);
-      
+
       // 폴링 시작
       startPolling(newTaskIds);
-
     } catch (err: any) {
       const errorMsg = err.response?.data?.detail || err.message || "백필 시작 실패";
       alert(`백필 시작 실패: ${errorMsg}`);
@@ -195,20 +288,17 @@ const AdminPage: React.FC = () => {
       setLoading(false);
     }
   };
-  
+
   // "수집 중지" 버튼 핸들러
   const handleStopCollection = async () => {
     if (!isBackfillRunning) return;
     setLoading(true);
-    
+
     try {
       // 모든 활성 Task ID에 대해 중지 요청
-      await Promise.allSettled(
-        allTaskIds.map(id => api.post(`/ohlcv/stop/${id}`))
-      );
-      
+      await Promise.allSettled(allTaskIds.map((id) => api.post(`/ohlcv/stop/${id}`)));
+
       alert("모든 작업에 중지 신호를 보냈습니다. (반영에 시간이 걸릴 수 있음)");
-      
     } catch (err: any) {
       alert(`작업 중지 실패: ${err.message}`);
     } finally {
@@ -221,95 +311,13 @@ const AdminPage: React.FC = () => {
     }
   };
 
-  // 폴링 및 상태 업데이트 로직
-  const pollBulkStatuses = async (ids: string[]) => {
-    if (!ids.length) return;
-    try {
-      // (가정) 백엔드에 'POST /ohlcv/status/bulk' 엔드포인트가 구현되어 있어야 함
-      // (이전 답변의 routers/ohlcv_backfill.py에는 이 기능이 누락되어 있으므로, 백엔드에 추가 필요)
-      
-      // (임시) 개별 폴링으로 대체 (비효율적이지만, 이전 답변 백엔드와 호환됨)
-      const responses = await Promise.allSettled(
-        ids.map(id => api.get<TaskStatusResponse>(`/ohlcv/status/${id}`))
-      );
-      const items = responses
-        .filter(res => res.status === 'fulfilled')
-        .map(res => (res as PromiseFulfilledResult<axios.AxiosResponse<TaskStatusResponse>>).value.data);
-
-
-
-      setProgressMap((prev) => {
-        const next: Record<string, SymbolProgress> = JSON.parse(JSON.stringify(prev));
-        
-        // 1. 개별 인터벌 상태 업데이트
-        for (const item of items) {
-          const taskInfo = taskMap[item.task_id];
-          if (!taskInfo) continue;
-          
-          const { symbol, interval } = taskInfo;
-          if (!next[symbol]) continue;
-
-          const meta = item.meta || {};
-          const prevInterval = next[symbol].intervals[interval];
-          
-          next[symbol].intervals[interval] = {
-            interval: interval,
-            state: item.state as CeleryState,
-            pct_time: clampPct(meta.pct ?? prevInterval?.pct_time ?? 0),
-            last_updated_iso: meta.last_candle_time ?? prevInterval?.last_updated_iso ?? null,
-          };
-        }
-
-        // 2. 전체 심볼 상태 재계산
-        for (const symbol in next) {
-          const symbolProgress = next[symbol];
-          const symbolIntervals = INTERVAL_ORDER
-            .map(intv => symbolProgress.intervals[intv])
-            .filter(Boolean) as IntervalProgress[]; // 이 심볼에 할당된 모든 인터벌 작업
-            
-          if (symbolIntervals.length === 0) {
-             // 이 심볼에 대해 시작된 작업이 없음
-             symbolProgress.state = "UNKNOWN"; // 혹은 'PENDING'
-             symbolProgress.status = "수집 대기 중";
-             continue;
-          }
-
-          if (symbolIntervals.some(iv => iv.state === "FAILURE")) {
-            symbolProgress.state = "FAILURE";
-            symbolProgress.status = "하나 이상의 인터벌 수집 실패";
-          } else if (symbolIntervals.every(iv => iv.state === "SUCCESS")) {
-            symbolProgress.state = "SUCCESS";
-            symbolProgress.status = "모든 인터벌 수집 완료";
-          } else if (symbolIntervals.some(iv => iv.state === "PROGRESS" || iv.state === "STARTED")) {
-            symbolProgress.state = "PROGRESS";
-            symbolProgress.status = "데이터 수집 중...";
-          } else if (symbolIntervals.every(iv => iv.state === "PENDING")) {
-            symbolProgress.state = "PENDING";
-            symbolProgress.status = "작업 대기 중...";
-          }
-        }
-        return next;
-      });
-
-      // 모든 작업이 완료(SUCCESS 또는 FAILURE)되었는지 확인
-      const allDone = items.every((it) => ["SUCCESS", "FAILURE"].includes(it.state));
-      if (allDone) {
-        stopPolling();
-        setAllTaskIds([]);
-        setTaskMap({});
-      }
-    } catch (err) {
-      console.error("벌크 상태 폴링 오류:", err);
-    }
-  };
-
   // 컴포넌트 unmount 시 폴링을 중지하도록 useEffect 남김
   useEffect(() => {
     // 컴포넌트가 사라질 때 인터벌 정리
     return () => {
       stopPolling();
     };
-  }, []); // 빈 배열로 마운트/언마운트 시 1회만 실행
+  }, []);
 
   const rows = useMemo(
     () =>
@@ -367,7 +375,6 @@ const AdminPage: React.FC = () => {
         <div className="p-4 md:p-6 border-b border-gray-700 sticky top-[132px] md:top-[144px] bg-gray-800/95 backdrop-blur z-10">
           <h2 className="text-lg font-semibold mb-4 text-green-400">2. OHLCV 데이터 수집</h2>
           <div className="flex flex-col md:flex-row items-stretch md:items-center gap-3">
-            
             {/* 수집 시작 버튼 */}
             <button
               onClick={handleStartCollection}
@@ -378,7 +385,7 @@ const AdminPage: React.FC = () => {
             >
               {isBackfillRunning ? "작업 진행 중..." : "모든 종목 데이터 수집 시작"}
             </button>
-            
+
             {/* 수집 중지 버튼 */}
             <button
               onClick={handleStopCollection}
@@ -392,17 +399,23 @@ const AdminPage: React.FC = () => {
 
             <div className="flex-1" />
             <div className="flex gap-2">
-              <button onClick={scrollToTop} className="px-3 py-2 rounded-md bg-gray-700 hover:bg-gray-600 text-xs">
+              <button
+                onClick={scrollToTop}
+                className="px-3 py-2 rounded-md bg-gray-700 hover:bg-gray-600 text-xs"
+              >
                 맨 위로
               </button>
-              <button onClick={scrollToBottom} className="px-3 py-2 rounded-md bg-gray-700 hover:bg-gray-600 text-xs">
+              <button
+                onClick={scrollToBottom}
+                className="px-3 py-2 rounded-md bg-gray-700 hover:bg-gray-600 text-xs"
+              >
                 맨 아래로
               </button>
             </div>
           </div>
         </div>
 
-        {/* 진행률 표시 (UI 로직 수정됨) */}
+        {/* 진행률 표시 */}
         <div ref={listContainerRef} className="px-4 md:px-6 pb-16 max-h-[70vh] overflow-y-auto">
           {rows.length > 0 ? (
             <div className="mt-4 space-y-4">
@@ -443,9 +456,7 @@ const AdminPage: React.FC = () => {
                   <div className="mt-2">
                     <div className="flex justify-between text-xs text-gray-300 mb-1">
                       <span>전체 진행률 (인터벌 평균)</span>
-                      <span>
-                        {overallPct}%
-                      </span>
+                      <span>{overallPct}%</span>
                     </div>
                     <div className="w-full bg-gray-600 rounded-full h-2.5">
                       <div
@@ -460,7 +471,7 @@ const AdminPage: React.FC = () => {
                     {INTERVAL_ORDER.map((iv) => {
                       const ivp = p.intervals[iv];
                       const pct = Math.round(clampPct(ivp?.pct_time ?? 0));
-                      
+
                       let tag: string;
                       let tagColor: string;
                       let barColor: string;
@@ -493,11 +504,14 @@ const AdminPage: React.FC = () => {
                           tagColor = "text-gray-600";
                           barColor = "bg-gray-800";
                       }
-                      
+
                       // 작업이 시작되지 않은 인터벌은 흐리게 처리
                       if (!ivp) {
                         return (
-                          <div key={iv} className="bg-gray-800/30 rounded-md p-3 border border-gray-700/50 opacity-50">
+                          <div
+                            key={iv}
+                            className="bg-gray-800/30 rounded-md p-3 border border-gray-700/50 opacity-50"
+                          >
                             <div className="flex items-center justify-between text-xs mb-1">
                               <span className="text-gray-500">{iv}</span>
                               <span className={tagColor}>{tag}</span>
@@ -508,7 +522,7 @@ const AdminPage: React.FC = () => {
                           </div>
                         );
                       }
-                      
+
                       // 작업이 시작된 인터벌
                       return (
                         <div key={iv} className="bg-gray-800/50 rounded-md p-3 border border-gray-700">
