@@ -40,6 +40,13 @@ const API_URL = (import.meta as any).env?.VITE_BACKEND_URL || "http://localhost:
 const POLLING_INTERVAL = 2000; // 폴링 간격
 const api = axios.create({ baseURL: API_URL, timeout: 20000 });
 
+// localStorage 키
+const STORAGE_KEYS = {
+  allTaskIds: "ohlcv_allTaskIds",
+  taskMap: "ohlcv_taskMap",
+  progressMap: "ohlcv_progressMap",
+};
+
 // 0~100 사이로 값 고정
 const clampPct = (v: any) => {
   const num = Number(v);
@@ -54,7 +61,7 @@ function computeOverallPct(p: SymbolProgress): number {
       const iv = p.intervals[intv];
       if (!iv) return undefined;
 
-      // ★ SUCCESS인데 pct_time이 0/99 등으로 덜 올라온 경우 100으로 보정해서 평균 계산
+      // SUCCESS인데 pct_time이 0/99 등으로 덜 올라온 경우 100으로 보정해서 평균 계산
       if (iv.state === "SUCCESS" && (!iv.pct_time || iv.pct_time < 100)) {
         return 100;
       }
@@ -75,6 +82,32 @@ const createEmptySymbolProgress = (symbol: string): SymbolProgress => ({
   status: "대기 중...",
   intervals: {},
 });
+
+// localStorage 저장
+const saveStateToStorage = (
+  ids: string[],
+  taskMap: Record<string, { symbol: string; interval: IntervalKey }>,
+  progressMap: Record<string, SymbolProgress>
+) => {
+  try {
+    localStorage.setItem(STORAGE_KEYS.allTaskIds, JSON.stringify(ids));
+    localStorage.setItem(STORAGE_KEYS.taskMap, JSON.stringify(taskMap));
+    localStorage.setItem(STORAGE_KEYS.progressMap, JSON.stringify(progressMap));
+  } catch (e) {
+    console.error("localStorage 저장 실패:", e);
+  }
+};
+
+// localStorage 제거
+const clearStateFromStorage = () => {
+  try {
+    localStorage.removeItem(STORAGE_KEYS.allTaskIds);
+    localStorage.removeItem(STORAGE_KEYS.taskMap);
+    localStorage.removeItem(STORAGE_KEYS.progressMap);
+  } catch (e) {
+    console.error("localStorage 삭제 실패:", e);
+  }
+};
 
 const AdminPage: React.FC = () => {
   const { isChecking, isValid } = useAuthCheck();
@@ -97,13 +130,22 @@ const AdminPage: React.FC = () => {
   const pollIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const listContainerRef = useRef<HTMLDivElement | null>(null);
 
+  // 한 번이라도 localStorage 복원 시도를 마쳤는지 여부
+  const [isRestored, setIsRestored] = useState(false);
+
   // taskMap이 바뀔 때마다 ref도 최신값으로 동기화
   useEffect(() => {
     taskMapRef.current = taskMap;
   }, [taskMap]);
 
-  // "진행 중" 여부를 allTaskIds 기준으로 판단
+  // 진행 중 여부
   const isBackfillRunning = useMemo(() => allTaskIds.length > 0, [allTaskIds]);
+
+  // ★ 복원 완료 후에만 localStorage에 저장
+  useEffect(() => {
+    if (!isRestored) return;
+    saveStateToStorage(allTaskIds, taskMap, progressMap);
+  }, [isRestored, allTaskIds, taskMap, progressMap]);
 
   const stopPolling = () => {
     if (pollIntervalRef.current) {
@@ -140,7 +182,7 @@ const AdminPage: React.FC = () => {
 
         // 1. 개별 인터벌 상태 업데이트
         for (const item of items) {
-          const taskInfo = taskMapRef.current[item.task_id]; // ★ 항상 최신 taskMap 사용
+          const taskInfo = taskMapRef.current[item.task_id]; // 항상 최신 taskMap 사용
           if (!taskInfo) continue;
 
           const { symbol, interval } = taskInfo;
@@ -152,7 +194,7 @@ const AdminPage: React.FC = () => {
           const state = item.state as CeleryState;
           let pctTime = clampPct(meta.pct ?? prevInterval?.pct_time ?? 0);
 
-          // ★ state가 SUCCESS이면 진행률은 무조건 100%로 보정
+          // state가 SUCCESS이면 진행률은 무조건 100%로 보정
           if (state === "SUCCESS" && pctTime < 100) {
             pctTime = 100;
           }
@@ -173,7 +215,6 @@ const AdminPage: React.FC = () => {
           ) as IntervalProgress[]; // 이 심볼에 할당된 모든 인터벌 작업
 
           if (symbolIntervals.length === 0) {
-            // 이 심볼에 대해 시작된 작업이 없음
             symbolProgress.state = "UNKNOWN"; // 혹은 'PENDING'
             symbolProgress.status = "수집 대기 중";
             continue;
@@ -204,6 +245,7 @@ const AdminPage: React.FC = () => {
         stopPolling();
         setAllTaskIds([]);
         setTaskMap({});
+        clearStateFromStorage();
       }
     } catch (err) {
       console.error("벌크 상태 폴링 오류:", err);
@@ -224,6 +266,47 @@ const AdminPage: React.FC = () => {
       if (!document.hidden) void pollBulkStatuses(ids);
     }, POLLING_INTERVAL);
   };
+
+  // ★ 새로고침/재입장 시 localStorage에서 상태 복원
+  const restoreFromStorage = () => {
+    try {
+      const idsStr = localStorage.getItem(STORAGE_KEYS.allTaskIds);
+      if (idsStr) {
+        const ids = JSON.parse(idsStr) as string[];
+        if (ids && ids.length > 0) {
+          const taskMapStr = localStorage.getItem(STORAGE_KEYS.taskMap);
+          const progressStr = localStorage.getItem(STORAGE_KEYS.progressMap);
+          if (taskMapStr && progressStr) {
+            const storedTaskMap = JSON.parse(taskMapStr) as Record<
+              string,
+              { symbol: string; interval: IntervalKey }
+            >;
+            const storedProgressMap = JSON.parse(progressStr) as Record<string, SymbolProgress>;
+
+            taskMapRef.current = storedTaskMap;
+            setTaskMap(storedTaskMap);
+            setProgressMap(storedProgressMap);
+            setAllTaskIds(ids);
+
+            // 다시 폴링 시작
+            startPolling(ids);
+          }
+        }
+      }
+    } catch (e) {
+      console.error("localStorage 복원 실패:", e);
+    } finally {
+      // 복원 시도는 끝났다 → 이후부터는 저장 허용
+      setIsRestored(true);
+    }
+  };
+
+  // 인증 끝나고 유효하면 한 번만 복원 시도
+  useEffect(() => {
+    if (!isChecking && isValid && !isRestored) {
+      restoreFromStorage();
+    }
+  }, [isChecking, isValid, isRestored]);
 
   // "1. 종목 정보 갱신"
   const handleRegisterSymbols = async () => {
@@ -250,6 +333,7 @@ const AdminPage: React.FC = () => {
     setProgressMap({});
     setTaskMap({});
     setAllTaskIds([]);
+    clearStateFromStorage();
     stopPolling();
 
     try {
@@ -262,6 +346,7 @@ const AdminPage: React.FC = () => {
       }
 
       const intervalsToFetch = [...INTERVAL_ORDER]; // (현재는 사용 안 하지만 향후 확장 대비)
+      void intervalsToFetch; // ts에서 안 쓴다고 뭐라하지 않게
 
       // 백엔드 엔드포인트 호출 (Body가 비어있음)
       const res = await api.post(`/ohlcv/backfill`, {});
@@ -292,6 +377,7 @@ const AdminPage: React.FC = () => {
         };
       }
 
+      taskMapRef.current = newTaskMap;
       setProgressMap(newProgressMap);
       setTaskMap(newTaskMap);
       setAllTaskIds(newTaskIds);
@@ -323,6 +409,7 @@ const AdminPage: React.FC = () => {
       stopPolling();
       setAllTaskIds([]);
       setTaskMap({});
+      clearStateFromStorage();
       // progressMap은 마지막 상태를 보여주기 위해 유지
       setLoading(false);
     }
@@ -330,7 +417,6 @@ const AdminPage: React.FC = () => {
 
   // 컴포넌트 unmount 시 폴링을 중지하도록 useEffect 남김
   useEffect(() => {
-    // 컴포넌트가 사라질 때 인터벌 정리
     return () => {
       stopPolling();
     };
@@ -488,7 +574,7 @@ const AdminPage: React.FC = () => {
                     {INTERVAL_ORDER.map((iv) => {
                       const ivp = p.intervals[iv];
                       const basePct = ivp?.pct_time ?? 0;
-                      // ★ SUCCESS인데 100보다 작게 찍혀 있으면 표시만이라도 100으로 보정
+                      // SUCCESS인데 100보다 작게 찍혀 있으면 표시만이라도 100으로 보정
                       const pct =
                         ivp && ivp.state === "SUCCESS" && basePct < 100
                           ? 100
