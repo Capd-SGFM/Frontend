@@ -2,21 +2,54 @@ import React, { useState, useRef, useEffect, useMemo } from "react";
 import axios from "axios";
 import { useAuthCheck } from "../components/is_logined";
 
-type CeleryState = "PENDING" | "PROGRESS" | "SUCCESS" | "FAILURE" | "STARTED" | "UNKNOWN";
-// DB 스키마에 정의된 모든 인터벌을 포함
-type IntervalKey = "1m" | "3m" | "5m" | "15m" | "30m" | "1h" | "4h" | "1d" | "1w" | "1M";
-const INTERVAL_ORDER: IntervalKey[] = ["1m", "3m", "5m", "15m", "30m", "1h", "4h", "1d", "1w", "1M"];
+type CeleryState =
+  | "PENDING"
+  | "PROGRESS"
+  | "SUCCESS"
+  | "FAILURE"
+  | "STARTED"
+  | "UNKNOWN";
 
-// --- (백엔드 /routers/schemas.py와 일치하는 타입) ---
-interface TaskInfo {
-  task_id: string;
-  symbol: string;
-  interval: string;
+// interval 축소 버전
+type IntervalKey = "1h" | "4h" | "1d" | "1w" | "1M";
+const INTERVAL_ORDER: IntervalKey[] = ["1h", "4h", "1d", "1w", "1M"];
+
+// --- 파이프라인 상태(엔진 4개) 타입 ---
+type EngineStatusState = "WAIT" | "PROGRESS" | "FAIL" | "FAILURE" | "UNKNOWN";
+
+interface EngineStatus {
+  id: number;
+  is_active: boolean;
+  status: EngineStatusState;
+  last_error?: string | null;
+  updated_at?: string | null;
 }
-interface TaskStatusResponse {
-  task_id: string;
+
+interface PipelineStatusApiResponse {
+  is_active: boolean;
+  websocket: EngineStatus;
+  backfill: EngineStatus;
+  rest_maintenance: EngineStatus;
+  indicator: EngineStatus;
+}
+
+// --- /pipeline/backfill/progress 응답 타입 ---
+interface BackfillIntervalApi {
+  interval: IntervalKey;
+  state: string; // CeleryState 혹은 "COMPLETE" 등 문자열
+  pct_time: number;
+  last_updated_iso: string | null;
+}
+
+interface BackfillSymbolApi {
+  symbol: string;
   state: string;
-  meta: any;
+  intervals: Record<string, BackfillIntervalApi>; // key: "1h", "4h" ...
+}
+
+interface BackfillProgressApiResponse {
+  run_id: string | null;
+  symbols: Record<string, BackfillSymbolApi>;
 }
 
 // --- (UI 상태를 위한 타입) ---
@@ -29,23 +62,15 @@ interface IntervalProgress {
 
 interface SymbolProgress {
   symbol: string;
-  state: CeleryState; // "PROGRESS", "SUCCESS" 등 (개별 인터벌 상태에서 파생됨)
+  state: CeleryState; // "PROGRESS", "SUCCESS" 등
   status: string; // "수집 중...", "완료" 등
-  // 모든 인터벌의 개별 진행 상황
   intervals: Partial<Record<IntervalKey, IntervalProgress>>;
 }
 // ---------------------------------------------------
 
 const API_URL = (import.meta as any).env?.VITE_BACKEND_URL || "http://localhost:8080";
-const POLLING_INTERVAL = 2000; // 폴링 간격
+const POLLING_INTERVAL = 2000; // 2초
 const api = axios.create({ baseURL: API_URL, timeout: 20000 });
-
-// localStorage 키
-const STORAGE_KEYS = {
-  allTaskIds: "ohlcv_allTaskIds",
-  taskMap: "ohlcv_taskMap",
-  progressMap: "ohlcv_progressMap",
-};
 
 // 0~100 사이로 값 고정
 const clampPct = (v: any) => {
@@ -61,7 +86,7 @@ function computeOverallPct(p: SymbolProgress): number {
       const iv = p.intervals[intv];
       if (!iv) return undefined;
 
-      // SUCCESS인데 pct_time이 0/99 등으로 덜 올라온 경우 100으로 보정해서 평균 계산
+      // SUCCESS인데 pct_time이 덜 올라와 있으면 100으로 보정
       if (iv.state === "SUCCESS" && (!iv.pct_time || iv.pct_time < 100)) {
         return 100;
       }
@@ -75,350 +100,257 @@ function computeOverallPct(p: SymbolProgress): number {
   return Math.round(sum / percentages.length);
 }
 
-// 심볼에 대한 초기 상태 객체를 생성
+// 심볼에 대한 초기 상태 객체 (필요 시)
 const createEmptySymbolProgress = (symbol: string): SymbolProgress => ({
-  symbol: symbol,
+  symbol,
   state: "PENDING",
   status: "대기 중...",
   intervals: {},
 });
 
-// localStorage 저장
-const saveStateToStorage = (
-  ids: string[],
-  taskMap: Record<string, { symbol: string; interval: IntervalKey }>,
-  progressMap: Record<string, SymbolProgress>
-) => {
-  try {
-    localStorage.setItem(STORAGE_KEYS.allTaskIds, JSON.stringify(ids));
-    localStorage.setItem(STORAGE_KEYS.taskMap, JSON.stringify(taskMap));
-    localStorage.setItem(STORAGE_KEYS.progressMap, JSON.stringify(progressMap));
-  } catch (e) {
-    console.error("localStorage 저장 실패:", e);
-  }
-};
-
-// localStorage 제거
-const clearStateFromStorage = () => {
-  try {
-    localStorage.removeItem(STORAGE_KEYS.allTaskIds);
-    localStorage.removeItem(STORAGE_KEYS.taskMap);
-    localStorage.removeItem(STORAGE_KEYS.progressMap);
-  } catch (e) {
-    console.error("localStorage 삭제 실패:", e);
-  }
-};
-
 const AdminPage: React.FC = () => {
   const { isChecking, isValid } = useAuthCheck();
 
   const [registerMessage, setRegisterMessage] = useState("");
-  const [loading, setLoading] = useState(false); // UI 로딩 (버튼 클릭 시)
+  const [loading, setLoading] = useState(false); // 버튼 로딩
+
+  // 파이프라인 전체 ON/OFF 상태 (id=1)
+  const [pipelineActive, setPipelineActive] = useState<boolean | null>(null);
+  const [pipelineStatusMessage, setPipelineStatusMessage] = useState<string>("");
+
+  // 엔진 4개 상태 + 에러 로그
+  const [engineStatus, setEngineStatus] = useState<{
+    websocket?: EngineStatus;
+    backfill?: EngineStatus;
+    rest_maintenance?: EngineStatus;
+    indicator?: EngineStatus;
+  }>({});
 
   // UI 표시에 사용되는 메인 상태 (심볼 기준)
   const [progressMap, setProgressMap] = useState<Record<string, SymbolProgress>>({});
 
-  // Celery 작업 추적용 상태
-  // (Task ID -> {심볼, 인터벌}) 매핑
-  const [taskMap, setTaskMap] = useState<Record<string, { symbol: string; interval: IntervalKey }>>({});
-  // 최신 taskMap을 폴링 콜백에서도 보기 위한 ref
-  const taskMapRef = useRef<Record<string, { symbol: string; interval: IntervalKey }>>({});
-
-  // (현재 실행/폴링 중인 모든 Task ID 목록)
-  const [allTaskIds, setAllTaskIds] = useState<string[]>([]);
-
-  const pollIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const backfillPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const pipelinePollRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const listContainerRef = useRef<HTMLDivElement | null>(null);
 
-  // 한 번이라도 localStorage 복원 시도를 마쳤는지 여부
-  const [isRestored, setIsRestored] = useState(false);
+  const isPipelineActive = pipelineActive === true;
 
-  // taskMap이 바뀔 때마다 ref도 최신값으로 동기화
-  useEffect(() => {
-    taskMapRef.current = taskMap;
-  }, [taskMap]);
+  // Backfill 진행현황 모달 표시 여부
+  const [showBackfillPanel, setShowBackfillPanel] = useState(false);
 
-  // 진행 중 여부
-  const isBackfillRunning = useMemo(() => allTaskIds.length > 0, [allTaskIds]);
-
-  // ★ 복원 완료 후에만 localStorage에 저장
-  useEffect(() => {
-    if (!isRestored) return;
-    saveStateToStorage(allTaskIds, taskMap, progressMap);
-  }, [isRestored, allTaskIds, taskMap, progressMap]);
-
-  const stopPolling = () => {
-    if (pollIntervalRef.current) {
-      clearInterval(pollIntervalRef.current);
-      pollIntervalRef.current = null;
+  const stopBackfillPolling = () => {
+    if (backfillPollRef.current) {
+      clearInterval(backfillPollRef.current);
+      backfillPollRef.current = null;
     }
   };
 
-  // 폴링 및 상태 업데이트 로직 (taskMapRef 사용)
-  const pollBulkStatuses = async (ids: string[]) => {
-    if (!ids.length) return;
+  const stopPipelineStatusPolling = () => {
+    if (pipelinePollRef.current) {
+      clearInterval(pipelinePollRef.current);
+      pipelinePollRef.current = null;
+    }
+  };
+
+  // --- Backfill 진행률 폴링 (/pipeline/backfill/progress) ---
+  const fetchBackfillProgress = async () => {
     try {
-      const responses = await Promise.allSettled(
-        ids.map((id) => api.get<TaskStatusResponse>(`/ohlcv/status/${id}`))
-      );
+      const res = await api.get<BackfillProgressApiResponse>("/pipeline/backfill/progress");
+      const data = res.data;
 
-      const items: TaskStatusResponse[] = [];
-      responses.forEach((res, idx) => {
-        const taskId = ids[idx];
-        if (res.status === "fulfilled") {
-          items.push(res.value.data);
-        } else {
-          console.error("status 요청 실패:", taskId, res.reason);
-        }
-      });
-
-      if (items.length === 0) {
-        // 한 번도 성공적으로 상태를 못 받았으면 여기서 그냥 리턴 (다음 폴링 시도)
+      if (!data.run_id || !data.symbols || Object.keys(data.symbols).length === 0) {
+        // 진행 중인 run이 없으면 비워두거나 이전 상태 유지 선택 가능
+        // 여기서는 그냥 비워버리자
+        setProgressMap({});
         return;
       }
 
-      setProgressMap((prev) => {
-        const next: Record<string, SymbolProgress> = JSON.parse(JSON.stringify(prev));
+      const next: Record<string, SymbolProgress> = {};
 
-        // 1. 개별 인터벌 상태 업데이트
-        for (const item of items) {
-          const taskInfo = taskMapRef.current[item.task_id]; // 항상 최신 taskMap 사용
-          if (!taskInfo) continue;
+      Object.values(data.symbols).forEach((sym) => {
+        const intervals: Partial<Record<IntervalKey, IntervalProgress>> = {};
+        const rawIntervals = sym.intervals || {};
 
-          const { symbol, interval } = taskInfo;
-          if (!next[symbol]) continue;
+        INTERVAL_ORDER.forEach((iv) => {
+          const apiIv = rawIntervals[iv];
+          if (!apiIv) return;
 
-          const meta = item.meta || {};
-          const prevInterval = next[symbol].intervals[interval];
+          const state = (apiIv.state as CeleryState) || "UNKNOWN";
+          const pct = clampPct(apiIv.pct_time);
 
-          const state = item.state as CeleryState;
-          let pctTime = clampPct(meta.pct ?? prevInterval?.pct_time ?? 0);
-
-          // state가 SUCCESS이면 진행률은 무조건 100%로 보정
-          if (state === "SUCCESS" && pctTime < 100) {
-            pctTime = 100;
-          }
-
-          next[symbol].intervals[interval] = {
-            interval: interval,
+          intervals[iv] = {
+            interval: iv,
             state,
-            pct_time: pctTime,
-            last_updated_iso: meta.last_candle_time ?? prevInterval?.last_updated_iso ?? null,
+            pct_time: pct,
+            last_updated_iso: apiIv.last_updated_iso,
           };
+        });
+
+        const sp: SymbolProgress = {
+          symbol: sym.symbol,
+          state: (sym.state as CeleryState) || "UNKNOWN",
+          status: "",
+          intervals,
+        };
+
+        // 심볼 단위 상태/메시지 재계산
+        const intervalList = INTERVAL_ORDER.map((iv) => intervals[iv]).filter(
+          Boolean
+        ) as IntervalProgress[];
+
+        if (intervalList.length === 0) {
+          sp.state = "UNKNOWN";
+          sp.status = "수집 대기 중";
+        } else if (intervalList.some((iv) => iv.state === "FAILURE")) {
+          sp.state = "FAILURE";
+          sp.status = "하나 이상의 인터벌 수집 실패";
+        } else if (intervalList.every((iv) => iv.state === "SUCCESS")) {
+          sp.state = "SUCCESS";
+          sp.status = "모든 인터벌 수집 완료";
+        } else if (
+          intervalList.some((iv) => iv.state === "PROGRESS" || iv.state === "STARTED")
+        ) {
+          sp.state = "PROGRESS";
+          sp.status = "데이터 수집 중...";
+        } else if (intervalList.every((iv) => iv.state === "PENDING")) {
+          sp.state = "PENDING";
+          sp.status = "작업 대기 중...";
+        } else {
+          sp.state = "UNKNOWN";
+          sp.status = "상태 확인 중...";
         }
 
-        // 2. 전체 심볼 상태 재계산
-        for (const symbol in next) {
-          const symbolProgress = next[symbol];
-          const symbolIntervals = INTERVAL_ORDER.map((intv) => symbolProgress.intervals[intv]).filter(
-            Boolean
-          ) as IntervalProgress[]; // 이 심볼에 할당된 모든 인터벌 작업
-
-          if (symbolIntervals.length === 0) {
-            symbolProgress.state = "UNKNOWN"; // 혹은 'PENDING'
-            symbolProgress.status = "수집 대기 중";
-            continue;
-          }
-
-          if (symbolIntervals.some((iv) => iv.state === "FAILURE")) {
-            symbolProgress.state = "FAILURE";
-            symbolProgress.status = "하나 이상의 인터벌 수집 실패";
-          } else if (symbolIntervals.every((iv) => iv.state === "SUCCESS")) {
-            symbolProgress.state = "SUCCESS";
-            symbolProgress.status = "모든 인터벌 수집 완료";
-          } else if (symbolIntervals.some((iv) => iv.state === "PROGRESS" || iv.state === "STARTED")) {
-            symbolProgress.state = "PROGRESS";
-            symbolProgress.status = "데이터 수집 중...";
-          } else if (symbolIntervals.every((iv) => iv.state === "PENDING")) {
-            symbolProgress.state = "PENDING";
-            symbolProgress.status = "작업 대기 중...";
-          }
-        }
-
-        return next;
+        next[sym.symbol] = sp;
       });
 
-      // 모든 작업이 완료(SUCCESS 또는 FAILURE)되었는지 확인
-      const allDone =
-        items.length > 0 && items.every((it) => ["SUCCESS", "FAILURE"].includes(it.state));
-      if (allDone) {
-        stopPolling();
-        setAllTaskIds([]);
-        setTaskMap({});
-        clearStateFromStorage();
-      }
+      setProgressMap(next);
     } catch (err) {
-      console.error("벌크 상태 폴링 오류:", err);
+      console.error("Backfill 진행률 조회 실패:", err);
+      // 에러라고 해서 progressMap을 꼭 비울 필요는 없음 (이전 상태 유지)
     }
   };
 
-  // 폴링 시작 로직 (task ID 목록만 받음)
-  const startPolling = (ids: string[]) => {
-    stopPolling();
-    if (!ids.length) return;
-
-    // 즉시 1회 실행
-    void pollBulkStatuses(ids);
-
-    // 인터벌 설정
-    pollIntervalRef.current = setInterval(() => {
-      // 화면이 보일 때만 폴링
-      if (!document.hidden) void pollBulkStatuses(ids);
+  const startBackfillPolling = () => {
+    stopBackfillPolling();
+    // 즉시 1회
+    void fetchBackfillProgress();
+    // 주기적으로
+    backfillPollRef.current = setInterval(() => {
+      if (!document.hidden) {
+        void fetchBackfillProgress();
+      }
     }, POLLING_INTERVAL);
   };
 
-  // ★ 새로고침/재입장 시 localStorage에서 상태 복원
-  const restoreFromStorage = () => {
-    try {
-      const idsStr = localStorage.getItem(STORAGE_KEYS.allTaskIds);
-      if (idsStr) {
-        const ids = JSON.parse(idsStr) as string[];
-        if (ids && ids.length > 0) {
-          const taskMapStr = localStorage.getItem(STORAGE_KEYS.taskMap);
-          const progressStr = localStorage.getItem(STORAGE_KEYS.progressMap);
-          if (taskMapStr && progressStr) {
-            const storedTaskMap = JSON.parse(taskMapStr) as Record<
-              string,
-              { symbol: string; interval: IntervalKey }
-            >;
-            const storedProgressMap = JSON.parse(progressStr) as Record<string, SymbolProgress>;
-
-            taskMapRef.current = storedTaskMap;
-            setTaskMap(storedTaskMap);
-            setProgressMap(storedProgressMap);
-            setAllTaskIds(ids);
-
-            // 다시 폴링 시작
-            startPolling(ids);
-          }
-        }
-      }
-    } catch (e) {
-      console.error("localStorage 복원 실패:", e);
-    } finally {
-      // 복원 시도는 끝났다 → 이후부터는 저장 허용
-      setIsRestored(true);
-    }
-  };
-
-  // 인증 끝나고 유효하면 한 번만 복원 시도
+  // --- 파이프라인 상태(4개 엔진 포함) 폴링 ---
   useEffect(() => {
-    if (!isChecking && isValid && !isRestored) {
-      restoreFromStorage();
+    if (isChecking || !isValid) return;
+
+    const fetchStatus = async () => {
+      try {
+        const res = await api.get<PipelineStatusApiResponse>("/pipeline/status");
+        setPipelineActive(res.data.is_active);
+        setPipelineStatusMessage(
+          res.data.is_active ? "데이터 수집 파이프라인 활성화됨" : "파이프라인 비활성 상태"
+        );
+        setEngineStatus({
+          websocket: res.data.websocket,
+          backfill: res.data.backfill,
+          rest_maintenance: res.data.rest_maintenance,
+          indicator: res.data.indicator,
+        });
+      } catch (err) {
+        console.error("파이프라인 상태 조회 실패:", err);
+        setPipelineStatusMessage("파이프라인 상태 조회 실패");
+      }
+    };
+
+    // 즉시 1회
+    void fetchStatus();
+    // 주기적 폴링
+    pipelinePollRef.current = setInterval(() => {
+      if (!document.hidden) {
+        void fetchStatus();
+      }
+    }, POLLING_INTERVAL);
+
+    return () => {
+      stopPipelineStatusPolling();
+    };
+  }, [isChecking, isValid]);
+
+  // 인증 끝났을 때 백필 진행률 폴링 시작
+  useEffect(() => {
+    if (!isChecking && isValid) {
+      startBackfillPolling();
     }
-  }, [isChecking, isValid, isRestored]);
+  }, [isChecking, isValid]);
 
   // "1. 종목 정보 갱신"
   const handleRegisterSymbols = async () => {
-    if (isBackfillRunning) return;
     setLoading(true);
     setRegisterMessage("");
     try {
       const res = await api.post(`/get_symbol_info/register_symbols`);
       setRegisterMessage(res.data?.message || "종목 정보 갱신 완료");
     } catch (err: any) {
-      const errorMsg = err.response?.data?.detail || err.message || "종목 갱신 실패";
+      const errorMsg =
+        err.response?.data?.detail || err.message || "종목 갱신 실패";
       setRegisterMessage(`실패: ${errorMsg}`);
     } finally {
       setLoading(false);
     }
   };
 
-  // "2. OHLCV 데이터 백필" -> "수집 시작"
+  // "데이터 수집 ON" → 파이프라인 ON
   const handleStartCollection = async () => {
-    if (isBackfillRunning) return;
+    if (isPipelineActive) {
+      // 이미 ON이면 무시
+      return;
+    }
+
     setLoading(true);
-
-    // 상태 초기화
-    setProgressMap({});
-    setTaskMap({});
-    setAllTaskIds([]);
-    clearStateFromStorage();
-    stopPolling();
-
     try {
-      // DB의 모든 심볼을 가져오도록 백엔드에 요청
-      const symbolsRes = await api.get<{ symbols: string[] }>("/symbols/all");
-      const symbolsToFetch = symbolsRes.data?.symbols;
-
-      if (!symbolsToFetch || symbolsToFetch.length === 0) {
-        throw new Error("서버에서 조회된 심볼이 없습니다. '종목 정보 갱신'을 먼저 실행하세요.");
-      }
-
-      const intervalsToFetch = [...INTERVAL_ORDER]; // (현재는 사용 안 하지만 향후 확장 대비)
-      void intervalsToFetch; // ts에서 안 쓴다고 뭐라하지 않게
-
-      // 백엔드 엔드포인트 호출 (Body가 비어있음)
-      const res = await api.post(`/ohlcv/backfill`, {});
-      const { tasks } = (res.data || {}) as { tasks: TaskInfo[] };
-
-      if (!tasks || tasks.length === 0) throw new Error("백엔드에서 작업을 생성하지 못했습니다.");
-
-      const newProgressMap: Record<string, SymbolProgress> = {};
-      const newTaskMap: Record<string, { symbol: string; interval: IntervalKey }> = {};
-      const newTaskIds: string[] = [];
-
-      // UI에 모든 심볼을 먼저 표시
-      for (const symbol of symbolsToFetch) {
-        newProgressMap[symbol] = createEmptySymbolProgress(symbol);
-      }
-
-      // 백엔드에서 받은 실제 작업 정보로 상태 업데이트
-      for (const task of tasks) {
-        newTaskIds.push(task.task_id);
-        const intervalKey = task.interval as IntervalKey;
-        newTaskMap[task.task_id] = { symbol: task.symbol, interval: intervalKey };
-
-        // 해당 심볼의 인터벌에 "PENDING" 상태 추가
-        newProgressMap[task.symbol].intervals[intervalKey] = {
-          interval: intervalKey,
-          state: "PENDING",
-          pct_time: 0,
-        };
-      }
-
-      taskMapRef.current = newTaskMap;
-      setProgressMap(newProgressMap);
-      setTaskMap(newTaskMap);
-      setAllTaskIds(newTaskIds);
-
-      // 폴링 시작
-      startPolling(newTaskIds);
+      const pipelineRes = await api.post(`/pipeline/on`, {});
+      setPipelineActive(true);
+      setPipelineStatusMessage(
+        pipelineRes.data?.message || "파이프라인 활성화됨"
+      );
+      // 파이프라인 ON 이후에는 Celery가 알아서 WebSocket + Backfill 시작
+      // 프론트는 /pipeline/backfill/progress 폴링만 하면 됨
     } catch (err: any) {
-      const errorMsg = err.response?.data?.detail || err.message || "백필 시작 실패";
-      alert(`백필 시작 실패: ${errorMsg}`);
+      const errorMsg =
+        err.response?.data?.detail || err.message || "수집 시작 실패";
+      alert(`수집 시작 실패: ${errorMsg}`);
+      setPipelineActive(false);
+      setPipelineStatusMessage("파이프라인 비활성 상태 (시작 실패)");
     } finally {
       setLoading(false);
     }
   };
 
-  // "수집 중지" 버튼 핸들러
+  // "데이터 수집 OFF" → 파이프라인 OFF
   const handleStopCollection = async () => {
-    if (!isBackfillRunning) return;
+    if (!isPipelineActive) return;
+
     setLoading(true);
-
     try {
-      // 모든 활성 Task ID에 대해 중지 요청
-      await Promise.allSettled(allTaskIds.map((id) => api.post(`/ohlcv/stop/${id}`)));
-
-      alert("모든 작업에 중지 신호를 보냈습니다. (반영에 시간이 걸릴 수 있음)");
+      const res = await api.post(`/pipeline/off`, {});
+      setPipelineActive(false);
+      setPipelineStatusMessage(res.data?.message || "파이프라인 비활성화됨");
+      alert("데이터 수집 파이프라인을 중지했습니다.");
     } catch (err: any) {
-      alert(`작업 중지 실패: ${err.message}`);
+      alert(`파이프라인 중지 실패: ${err.message}`);
     } finally {
-      // 폴링 및 상태 즉시 중지
-      stopPolling();
-      setAllTaskIds([]);
-      setTaskMap({});
-      clearStateFromStorage();
-      // progressMap은 마지막 상태를 보여주기 위해 유지
       setLoading(false);
     }
   };
 
-  // 컴포넌트 unmount 시 폴링을 중지하도록 useEffect 남김
+  // 컴포넌트 unmount 시 폴링 중지
   useEffect(() => {
     return () => {
-      stopPolling();
+      stopBackfillPolling();
+      stopPipelineStatusPolling();
     };
   }, []);
 
@@ -445,6 +377,67 @@ const AdminPage: React.FC = () => {
     listContainerRef.current?.scrollTo({ top: 0, behavior: "smooth" });
   };
 
+  // 엔진별 상태 카드 렌더링 (Backfill 카드만 클릭 가능하도록 onClick 지원)
+  const renderEngineCard = (
+    label: string,
+    data?: EngineStatus,
+    onClick?: () => void
+  ) => {
+    const st: EngineStatusState = data?.status || "UNKNOWN";
+    const isActive = !!data?.is_active;
+
+    let badgeText = st;
+    let badgeClass = "text-gray-300 border-gray-500";
+    if (st === "PROGRESS") {
+      badgeText = "PROGRESS";
+      badgeClass = "text-blue-300 border-blue-400";
+    } else if (st === "WAIT") {
+      badgeText = "WAIT";
+      badgeClass = "text-gray-300 border-gray-500";
+    } else if (st === "FAIL" || st === "FAILURE") {
+      badgeText = "FAIL";
+      badgeClass = "text-red-300 border-red-400";
+    } else if (st === "UNKNOWN") {
+      badgeText = "UNKNOWN";
+      badgeClass = "text-gray-500 border-gray-600";
+    }
+
+    const Wrapper: any = onClick ? "button" : "div";
+
+    return (
+      <Wrapper
+        key={label}
+        type={onClick ? "button" : undefined}
+        onClick={onClick}
+        className={`bg-gray-900/60 border border-gray-700 rounded-md p-3 text-xs flex flex-col justify-between ${
+          onClick ? "hover:border-cyan-400 cursor-pointer transition-colors" : ""
+        }`}
+      >
+        <div>
+          <div className="flex items-center justify-between mb-1">
+            <span className="font-semibold text-gray-100">{label}</span>
+            <span className={`px-2 py-0.5 rounded-full border ${badgeClass}`}>
+              {badgeText}
+            </span>
+          </div>
+          <p className="text-[11px] text-gray-300 mb-1">
+            {isActive ? "작업 활성화됨" : "작업 비활성 상태"}
+          </p>
+          {data?.updated_at && (
+            <p className="text-[10px] text-gray-500">
+              업데이트: {data.updated_at}
+            </p>
+          )}
+        </div>
+        {data?.last_error && (
+          <p className="text-[11px] text-red-400 mt-2 break-words">
+            에러: {data.last_error}
+          </p>
+        )}
+      </Wrapper>
+    );
+  };
+
   if (isChecking)
     return (
       <div className="flex items-center justify-center w-screen h-screen bg-gray-900 text-white">
@@ -459,207 +452,295 @@ const AdminPage: React.FC = () => {
 
       {/* 1. 종목 정보 갱신 */}
       <div className="bg-gray-800 p-6 rounded-lg w-full max-w-3xl text-center shadow-xl border border-gray-700 mb-6 sticky top-0 z-20 backdrop-blur bg-gray-800/95">
-        <h2 className="text-lg font-semibold mb-4 text-cyan-400">1. 종목 정보 갱신</h2>
+        <h2 className="text-lg font-semibold mb-4 text-cyan-400">
+          1. 종목 정보 갱신
+        </h2>
         <button
           onClick={handleRegisterSymbols}
-          disabled={loading || isBackfillRunning}
+          disabled={loading}
           className={`w-full px-4 py-2 rounded-md font-semibold text-white ${
-            loading || isBackfillRunning ? "bg-blue-400 cursor-not-allowed" : "bg-blue-500 hover:bg-blue-600"
+            loading
+              ? "bg-blue-400 cursor-not-allowed"
+              : "bg-blue-500 hover:bg-blue-600"
           }`}
         >
           {loading ? "갱신 중..." : "기존 종목 정보 갱신 (CSV/API 기준)"}
         </button>
         {registerMessage && (
-          <p className={`text-sm mt-3 ${registerMessage.includes("실패") ? "text-red-400" : "text-green-400"}`}>
+          <p
+            className={`text-sm mt-3 ${
+              registerMessage.includes("실패") ? "text-red-400" : "text-green-400"
+            }`}
+          >
             {registerMessage}
           </p>
         )}
       </div>
 
-      {/* 2. OHLCV 백필 패널 */}
+      {/* 2. OHLCV 백필 + 파이프라인 제어 패널 */}
       <div className="bg-gray-800 w-full max-w-5xl rounded-lg shadow-xl border border-gray-700">
         <div className="p-4 md:p-6 border-b border-gray-700 sticky top-[132px] md:top-[144px] bg-gray-800/95 backdrop-blur z-10">
-          <h2 className="text-lg font-semibold mb-4 text-green-400">2. OHLCV 데이터 수집</h2>
+          <div className="flex items-center justify-between mb-2">
+            <h2 className="text-lg font-semibold text-green-400">
+              2. OHLCV 데이터 수집 파이프라인
+            </h2>
+            <span
+              className={`text-xs px-2 py-1 rounded-full border ${
+                isPipelineActive
+                  ? "text-green-300 border-green-400"
+                  : "text-gray-300 border-gray-500"
+              }`}
+            >
+              {pipelineActive === null
+                ? "상태 조회 중..."
+                : isPipelineActive
+                ? "ACTIVE"
+                : "INACTIVE"}
+            </span>
+          </div>
+          {pipelineStatusMessage && (
+            <p className="text-xs text-gray-300 mb-3">
+              {pipelineStatusMessage}
+            </p>
+          )}
+
           <div className="flex flex-col md:flex-row items-stretch md:items-center gap-3">
-            {/* 수집 시작 버튼 */}
+            {/* 단일 토글 버튼: OFF -> ON / ON -> OFF */}
             <button
-              onClick={handleStartCollection}
-              disabled={loading || isBackfillRunning}
+              onClick={isPipelineActive ? handleStopCollection : handleStartCollection}
+              disabled={loading}
               className={`w-full md:w-auto px-4 py-2 rounded-md font-semibold text-white ${
-                loading || isBackfillRunning ? "bg-green-400 cursor-not-allowed" : "bg-green-500 hover:bg-green-600"
+                loading
+                  ? "bg-green-400 cursor-not-allowed"
+                  : isPipelineActive
+                  ? "bg-red-500 hover:bg-red-600"
+                  : "bg-green-500 hover:bg-green-600"
               }`}
             >
-              {isBackfillRunning ? "작업 진행 중..." : "모든 종목 데이터 수집 시작"}
+              {loading
+                ? isPipelineActive
+                  ? "중지 중..."
+                  : "시작 중..."
+                : isPipelineActive
+                ? "데이터 수집 파이프라인 OFF"
+                : "데이터 수집 파이프라인 ON (백필 + 실시간)"}
             </button>
+          </div>
 
-            {/* 수집 중지 버튼 */}
-            <button
-              onClick={handleStopCollection}
-              disabled={loading || !isBackfillRunning}
-              className={`w-full md:w-auto px-4 py-2 rounded-md font-semibold text-white ${
-                loading || !isBackfillRunning ? "bg-red-400 cursor-not-allowed" : "bg-red-500 hover:bg-red-600"
-              }`}
-            >
-              {loading ? "중지 중..." : "모든 작업 중지"}
-            </button>
-
-            <div className="flex-1" />
-            <div className="flex gap-2">
-              <button onClick={scrollToTop} className="px-3 py-2 rounded-md bg-gray-700 hover:bg-gray-600 text-xs">
-                맨 위로
-              </button>
-              <button
-                onClick={scrollToBottom}
-                className="px-3 py-2 rounded-md bg-gray-700 hover:bg-gray-600 text-xs"
-              >
-                맨 아래로
-              </button>
-            </div>
+          {/* 4개 작업(WebSocket / Backfill / REST / Indicator) 상태 + 에러 로그 */}
+          <div className="mt-4 grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-3">
+            {renderEngineCard("WebSocket 실시간 수집", engineStatus.websocket)}
+            {renderEngineCard(
+              "Backfill 엔진",
+              engineStatus.backfill,
+              () => setShowBackfillPanel(true) // ✅ 클릭 시 진행현황 모달 오픈
+            )}
+            {renderEngineCard(
+              "REST 유지보수 엔진",
+              engineStatus.rest_maintenance
+            )}
+            {renderEngineCard(
+              "보조지표 계산 엔진",
+              engineStatus.indicator
+            )}
           </div>
         </div>
 
-        {/* 진행률 표시 */}
-        <div ref={listContainerRef} className="px-4 md:px-6 pb-24 max-h-[calc(100vh-300px)] overflow-y-auto">
-          {rows.length > 0 ? (
-            <div className="mt-4 space-y-4">
-              {rows.map(({ idx, symbol, p, overallPct }) => (
-                <div
-                  key={symbol}
-                  className={`p-4 rounded-lg ${
-                    p.state === "FAILURE"
-                      ? "bg-red-900/50"
-                      : p.state === "SUCCESS"
-                      ? "bg-green-900/50"
-                      : "bg-gray-700"
-                  }`}
-                >
-                  {/* 심볼 이름, 전체 상태 */}
-                  <div className="flex items-center justify-between">
-                    <h3 className="text-lg font-semibold">
-                      {idx}. {symbol}
-                    </h3>
-                    <span
-                      className={`text-xs px-2 py-1 rounded-full border ${
-                        p.state === "SUCCESS"
-                          ? "text-green-300 border-green-400"
-                          : p.state === "FAILURE"
-                          ? "text-red-300 border-red-400"
-                          : p.state === "PROGRESS"
-                          ? "text-blue-300 border-blue-400"
-                          : "text-gray-400 border-gray-500"
-                      }`}
-                    >
-                      {p.state}
-                    </span>
-                  </div>
-
-                  <p className="text-sm text-gray-300 mt-1 truncate">{p.status || "-"}</p>
-
-                  {/* 심볼 전체 진행률 바 */}
-                  <div className="mt-2">
-                    <div className="flex justify-between text-xs text-gray-300 mb-1">
-                      <span>전체 진행률 (인터벌 평균)</span>
-                      <span>{overallPct}%</span>
-                    </div>
-                    <div className="w-full bg-gray-600 rounded-full h-2.5">
-                      <div
-                        className="bg-cyan-500 h-2.5 rounded-full transition-all duration-300"
-                        style={{ width: `${overallPct}%` }}
-                      />
-                    </div>
-                  </div>
-
-                  {/* 개별 인터벌 진행률 바 */}
-                  <div className="mt-3 grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-5 gap-3">
-                    {INTERVAL_ORDER.map((iv) => {
-                      const ivp = p.intervals[iv];
-                      const basePct = ivp?.pct_time ?? 0;
-                      // SUCCESS인데 100보다 작게 찍혀 있으면 표시만이라도 100으로 보정
-                      const pct =
-                        ivp && ivp.state === "SUCCESS" && basePct < 100
-                          ? 100
-                          : Math.round(clampPct(basePct));
-
-                      let tag: string;
-                      let tagColor: string;
-                      let barColor: string;
-
-                      switch (ivp?.state) {
-                        case "SUCCESS":
-                          tag = "완료";
-                          tagColor = "text-green-400";
-                          barColor = "bg-green-500";
-                          break;
-                        case "FAILURE":
-                          tag = "실패";
-                          tagColor = "text-red-400";
-                          barColor = "bg-red-500";
-                          break;
-                        case "PROGRESS":
-                        case "STARTED":
-                          tag = "진행중";
-                          tagColor = "text-blue-400";
-                          barColor = "bg-blue-500";
-                          break;
-                        case "PENDING":
-                          tag = "대기";
-                          tagColor = "text-gray-400";
-                          barColor = "bg-gray-700";
-                          break;
-                        default:
-                          // 이 심볼에 대해 이 인터벌은 아예 시작되지 않음
-                          tag = "-";
-                          tagColor = "text-gray-600";
-                          barColor = "bg-gray-800";
-                      }
-
-                      // 작업이 시작되지 않은 인터벌은 흐리게 처리
-                      if (!ivp) {
-                        return (
-                          <div
-                            key={iv}
-                            className="bg-gray-800/30 rounded-md p-3 border border-gray-700/50 opacity-50"
-                          >
-                            <div className="flex items-center justify-between text-xs mb-1">
-                              <span className="text-gray-500">{iv}</span>
-                              <span className={tagColor}>{tag}</span>
-                            </div>
-                            <div className="w-full bg-gray-700 rounded-full h-2">
-                              <div className={`${barColor} h-2 rounded-full`} style={{ width: `0%` }} />
-                            </div>
-                          </div>
-                        );
-                      }
-
-                      // 작업이 시작된 인터벌
-                      return (
-                        <div key={iv} className="bg-gray-800/50 rounded-md p-3 border border-gray-700">
-                          <div className="flex items-center justify-between text-xs mb-1">
-                            <span className="text-gray-300">{iv}</span>
-                            <span className={tagColor}>
-                              {pct}% · {tag}
-                            </span>
-                          </div>
-                          <div className="w-full bg-gray-600 rounded-full h-2">
-                            <div
-                              className={`${barColor} h-2 rounded-full transition-all duration-300`}
-                              style={{ width: `${pct}%` }}
-                            />
-                          </div>
-                        </div>
-                      );
-                    })}
-                  </div>
-                </div>
-              ))}
-            </div>
-          ) : (
-            <p className="text-sm text-gray-400 py-6 text-center">
-              {loading ? "작업 시작 중..." : "수집 시작 버튼을 눌러주세요."}
-            </p>
-          )}
+        {/* 안내 문구 (모달 사용 안내 정도로만) */}
+        <div className="px-4 md:px-6 py-6 text-center text-sm text-gray-400">
+          Backfill 엔진 카드를 클릭하면 심볼·인터벌별 상세 진행현황을 확인할 수 있습니다.
         </div>
       </div>
+
+      {/* ✅ Backfill 진행현황 모달 */}
+      {showBackfillPanel && (
+        <div className="fixed inset-0 z-40 flex items-center justify-center bg-black/60">
+          <div className="bg-gray-900 w-[95vw] max-w-5xl max-h-[85vh] rounded-lg shadow-2xl border border-gray-700 flex flex-col">
+            {/* 모달 헤더 */}
+            <div className="flex items-center justify-between px-4 py-3 border-b border-gray-700">
+              <div>
+                <h3 className="text-lg font-semibold text-cyan-300">
+                  Backfill 엔진 진행현황
+                </h3>
+                <p className="text-xs text-gray-400 mt-1">
+                  /pipeline/backfill/progress 기준 심볼·인터벌별 수집 상태
+                </p>
+              </div>
+              <div className="flex items-center gap-2">
+                <button
+                  onClick={scrollToTop}
+                  className="px-3 py-1.5 rounded-md bg-gray-800 hover:bg-gray-700 text-xs text-gray-200"
+                >
+                  맨 위로
+                </button>
+                <button
+                  onClick={scrollToBottom}
+                  className="px-3 py-1.5 rounded-md bg-gray-800 hover:bg-gray-700 text-xs text-gray-200"
+                >
+                  맨 아래로
+                </button>
+                <button
+                  onClick={() => setShowBackfillPanel(false)}
+                  className="ml-2 px-3 py-1.5 rounded-md bg-red-600 hover:bg-red-500 text-xs font-semibold"
+                >
+                  닫기
+                </button>
+              </div>
+            </div>
+
+            {/* 모달 본문: 기존 rows 리스트 재사용 */}
+            <div
+              ref={listContainerRef}
+              className="px-4 md:px-6 py-4 overflow-y-auto"
+            >
+              {rows.length > 0 ? (
+                <div className="space-y-4 pb-2">
+                  {rows.map(({ idx, symbol, p, overallPct }) => (
+                    <div
+                      key={symbol}
+                      className={`p-4 rounded-lg ${
+                        p.state === "FAILURE"
+                          ? "bg-red-900/50"
+                          : p.state === "SUCCESS"
+                          ? "bg-green-900/40"
+                          : "bg-gray-700"
+                      } border border-gray-600/60`}
+                    >
+                      {/* 심볼 이름, 전체 상태 */}
+                      <div className="flex items-center justify-between">
+                        <h3 className="text-lg font-semibold">
+                          {idx}. {symbol}
+                        </h3>
+                        <span
+                          className={`text-xs px-2 py-1 rounded-full border ${
+                            p.state === "SUCCESS"
+                              ? "text-green-300 border-green-400"
+                              : p.state === "FAILURE"
+                              ? "text-red-300 border-red-400"
+                              : p.state === "PROGRESS"
+                              ? "text-blue-300 border-blue-400"
+                              : "text-gray-400 border-gray-500"
+                          }`}
+                        >
+                          {p.state}
+                        </span>
+                      </div>
+
+                      <p className="text-sm text-gray-300 mt-1 truncate">
+                        {p.status || "-"}
+                      </p>
+
+                      {/* 심볼 전체 진행률 바 */}
+                      <div className="mt-2">
+                        <div className="flex justify-between text-xs text-gray-300 mb-1">
+                          <span>전체 진행률 (인터벌 평균)</span>
+                          <span>{overallPct}%</span>
+                        </div>
+                        <div className="w-full bg-gray-600 rounded-full h-2.5">
+                          <div
+                            className="bg-cyan-500 h-2.5 rounded-full transition-all duration-300"
+                            style={{ width: `${overallPct}%` }}
+                          />
+                        </div>
+                      </div>
+
+                      {/* 개별 인터벌 진행률 바 */}
+                      <div className="mt-3 grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-5 gap-3">
+                        {INTERVAL_ORDER.map((iv) => {
+                          const ivp = p.intervals[iv];
+                          const basePct = ivp?.pct_time ?? 0;
+                          const pct =
+                            ivp && ivp.state === "SUCCESS" && basePct < 100
+                              ? 100
+                              : Math.round(clampPct(basePct));
+
+                          let tag: string;
+                          let tagColor: string;
+                          let barColor: string;
+
+                          switch (ivp?.state) {
+                            case "SUCCESS":
+                              tag = "완료";
+                              tagColor = "text-green-400";
+                              barColor = "bg-green-500";
+                              break;
+                            case "FAILURE":
+                              tag = "실패";
+                              tagColor = "text-red-400";
+                              barColor = "bg-red-500";
+                              break;
+                            case "PROGRESS":
+                            case "STARTED":
+                              tag = "진행중";
+                              tagColor = "text-blue-400";
+                              barColor = "bg-blue-500";
+                              break;
+                            case "PENDING":
+                              tag = "대기";
+                              tagColor = "text-gray-400";
+                              barColor = "bg-gray-700";
+                              break;
+                            default:
+                              tag = "-";
+                              tagColor = "text-gray-600";
+                              barColor = "bg-gray-800";
+                          }
+
+                          if (!ivp) {
+                            return (
+                              <div
+                                key={iv}
+                                className="bg-gray-800/30 rounded-md p-3 border border-gray-700/50 opacity-50"
+                              >
+                                <div className="flex items-center justify-between text-xs mb-1">
+                                  <span className="text-gray-500">{iv}</span>
+                                  <span className={tagColor}>{tag}</span>
+                                </div>
+                                <div className="w-full bg-gray-700 rounded-full h-2">
+                                  <div
+                                    className={`${barColor} h-2 rounded-full`}
+                                    style={{ width: `0%` }}
+                                  />
+                                </div>
+                              </div>
+                            );
+                          }
+
+                          return (
+                            <div
+                              key={iv}
+                              className="bg-gray-800/50 rounded-md p-3 border border-gray-700"
+                            >
+                              <div className="flex items-center justify-between text-xs mb-1">
+                                <span className="text-gray-300">{iv}</span>
+                                <span className={tagColor}>
+                                  {pct}% · {tag}
+                                </span>
+                              </div>
+                              <div className="w-full bg-gray-600 rounded-full h-2">
+                                <div
+                                  className={`${barColor} h-2 rounded-full transition-all duration-300`}
+                                  style={{ width: `${pct}%` }}
+                                />
+                              </div>
+                            </div>
+                          );
+                        })}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              ) : (
+                <p className="text-sm text-gray-400 py-6 text-center">
+                  {loading
+                    ? "작업 시작 중..."
+                    : "진행 중인 Backfill 작업이 없습니다."}
+                </p>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 };
