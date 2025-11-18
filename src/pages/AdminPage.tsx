@@ -39,7 +39,9 @@ interface PipelineStatusApiResponse {
   indicator: EngineStatus;
 }
 
-// --- Backfill API 타입 ---
+/* ===========================
+ *  Backfill 진행률 API 타입
+ * =========================== */
 interface BackfillIntervalApi {
   interval: IntervalKey;
   state: string;
@@ -58,10 +60,31 @@ interface BackfillProgressApiResponse {
   symbols: Record<string, BackfillSymbolApi>;
 }
 
-// --- REST Maintenance Progress API ---
+/* ===========================
+ *  REST 유지보수 진행률 API 타입
+ *  (백엔드: { run_id, symbols: { [symbol]: { symbol, intervals: { [interval]: {interval, state, updated_at} } } } })
+ * =========================== */
+interface RestIntervalApi {
+  interval: string;
+  state: string;
+  updated_at: string | null;
+}
+
+interface RestSymbolApi {
+  symbol: string;
+  intervals: Record<string, RestIntervalApi>;
+}
+
+interface RestProgressApiResponse {
+  run_id: string | null;
+  symbols: Record<string, RestSymbolApi>;
+}
+
+/* REST UI용 변환 타입 */
 interface RestIntervalState {
   interval: IntervalKey;
-  state: "PENDING" | "SUCCESS" | "FAILURE";
+  state: "PENDING" | "SUCCESS" | "FAILURE" | "PROGRESS" | "UNKNOWN";
+  updated_at?: string | null;
 }
 
 interface RestSymbolState {
@@ -69,12 +92,28 @@ interface RestSymbolState {
   intervals: RestIntervalState[];
 }
 
-interface RestProgressApiResponse {
-  run_id: string | null;
-  items: RestSymbolState[];
+/* ===========================
+ *  Indicator 진행률 API 타입
+ *  (백엔드: { run_id, symbols: { [symbol]: { symbol, intervals: { [interval]: {interval, state, pct_time, updated_at} } } } })
+ * =========================== */
+interface IndicatorIntervalApi {
+  interval: string;
+  state: string;
+  pct_time: number;
+  updated_at: string | null;
 }
 
-// --- UI 상태 ---
+interface IndicatorSymbolApi {
+  symbol: string;
+  intervals: Record<string, IndicatorIntervalApi>;
+}
+
+interface IndicatorProgressApiResponse {
+  run_id: string | null;
+  symbols: Record<string, IndicatorSymbolApi>;
+}
+
+// --- 공통 UI 상태 타입 ---
 interface IntervalProgress {
   interval: IntervalKey;
   state: CeleryState;
@@ -137,25 +176,34 @@ const AdminPage: React.FC = () => {
     indicator?: EngineStatus;
   }>({});
 
-  const [progressMap, setProgressMap] = useState<
+  // Backfill 진행률
+  const [backfillProgressMap, setBackfillProgressMap] = useState<
     Record<string, SymbolProgress>
   >({});
 
+  // REST 유지보수 진행률
   const [restProgress, setRestProgress] = useState<RestSymbolState[]>([]);
   const [showRestPanel, setShowRestPanel] = useState(false);
+
+  // Indicator 진행률
+  const [indicatorProgressMap, setIndicatorProgressMap] = useState<
+    Record<string, SymbolProgress>
+  >({});
+  const [showIndicatorPanel, setShowIndicatorPanel] = useState(false);
 
   const backfillPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const pipelinePollRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   const listContainerRef = useRef<HTMLDivElement | null>(null);
   const restListRef = useRef<HTMLDivElement | null>(null);
+  const indicatorListRef = useRef<HTMLDivElement | null>(null);
 
   const isPipelineActive = pipelineActive === true;
   const [showBackfillPanel, setShowBackfillPanel] = useState(false);
 
-  // -----------------------------------------
-  // Backfill Polling
-  // -----------------------------------------
+  /* ======================================
+   * Backfill Polling
+   * ====================================== */
   const fetchBackfillProgress = async () => {
     try {
       const res = await api.get<BackfillProgressApiResponse>(
@@ -164,19 +212,20 @@ const AdminPage: React.FC = () => {
       const data = res.data;
 
       if (!data.run_id || !data.symbols) {
-        setProgressMap({});
+        setBackfillProgressMap({});
         return;
       }
 
       const next: Record<string, SymbolProgress> = {};
 
       Object.values(data.symbols).forEach((sym) => {
-        const intervals: any = {};
+        const intervals: Partial<Record<IntervalKey, IntervalProgress>> = {};
+
         for (const [intv, row] of Object.entries(sym.intervals)) {
           const interval = intv as IntervalKey;
           intervals[interval] = {
             interval,
-            state: row.state as CeleryState,
+            state: (row.state as CeleryState) || "UNKNOWN",
             pct_time: clampPct(row.pct_time),
             last_updated_iso: row.last_updated_iso,
           };
@@ -189,9 +238,12 @@ const AdminPage: React.FC = () => {
           intervals,
         };
 
-        const states = Object.values(intervals).map((x: any) => x.state);
+        const states = Object.values(intervals).map((x) => x!.state);
 
-        if (states.every((s) => s === "SUCCESS")) {
+        if (states.length === 0) {
+          sp.state = "UNKNOWN";
+          sp.status = "대기 중";
+        } else if (states.every((s) => s === "SUCCESS")) {
           sp.state = "SUCCESS";
           sp.status = "모든 인터벌 완료";
         } else if (states.some((s) => s === "FAILURE")) {
@@ -211,7 +263,7 @@ const AdminPage: React.FC = () => {
         next[sym.symbol] = sp;
       });
 
-      setProgressMap(next);
+      setBackfillProgressMap(next);
     } catch (err) {
       console.error("Backfill 폴링 실패:", err);
     }
@@ -226,24 +278,118 @@ const AdminPage: React.FC = () => {
       if (!document.hidden) fetchBackfillProgress();
     }, POLLING_INTERVAL);
   };
-  // -----------------------------------------
-  // REST Maintenance Progress 불러오기 (클릭 시 1회 호출)
-  // -----------------------------------------
+
+  /* ======================================
+   * REST Maintenance Progress (클릭 시 조회)
+   * ====================================== */
   const fetchRestProgress = async () => {
     try {
       const res = await api.get<RestProgressApiResponse>(
         "/pipeline/rest/progress"
       );
-      setRestProgress(res.data.items || []);
+      const data = res.data;
+
+      if (!data.run_id || !data.symbols) {
+        setRestProgress([]);
+        return;
+      }
+
+      const items: RestSymbolState[] = [];
+
+      Object.values(data.symbols).forEach((sym: RestSymbolApi) => {
+        const intervals: RestIntervalState[] = [];
+
+        Object.values(sym.intervals).forEach((iv: RestIntervalApi) => {
+          const interval = iv.interval as IntervalKey;
+          intervals.push({
+            interval,
+            state: (iv.state as any) || "UNKNOWN",
+            updated_at: iv.updated_at,
+          });
+        });
+
+        items.push({ symbol: sym.symbol, intervals });
+      });
+
+      setRestProgress(items);
     } catch (err) {
       console.error("REST progress 조회 실패:", err);
       setRestProgress([]);
     }
   };
 
-  // -----------------------------------------
-  // Pipeline Status polling
-  // -----------------------------------------
+  /* ======================================
+   * Indicator Progress (클릭 시 조회)
+   * ====================================== */
+  const fetchIndicatorProgress = async () => {
+    try {
+      const res = await api.get<IndicatorProgressApiResponse>(
+        "/pipeline/indicator/progress"
+      );
+      const data = res.data;
+
+      if (!data.run_id || !data.symbols) {
+        setIndicatorProgressMap({});
+        return;
+      }
+
+      const next: Record<string, SymbolProgress> = {};
+
+      Object.values(data.symbols).forEach((sym: IndicatorSymbolApi) => {
+        const intervals: Partial<Record<IntervalKey, IntervalProgress>> = {};
+
+        Object.values(sym.intervals).forEach((iv: IndicatorIntervalApi) => {
+          const interval = iv.interval as IntervalKey;
+          intervals[interval] = {
+            interval,
+            state: (iv.state as CeleryState) || "UNKNOWN",
+            pct_time: clampPct(iv.pct_time),
+            last_updated_iso: iv.updated_at,
+          };
+        });
+
+        const sp: SymbolProgress = {
+          symbol: sym.symbol,
+          state: "UNKNOWN",
+          status: "",
+          intervals,
+        };
+
+        const states = Object.values(intervals).map((x) => x!.state);
+
+        if (states.length === 0) {
+          sp.state = "UNKNOWN";
+          sp.status = "대기 중";
+        } else if (states.every((s) => s === "SUCCESS")) {
+          sp.state = "SUCCESS";
+          sp.status = "모든 인터벌 지표 계산 완료";
+        } else if (states.some((s) => s === "FAILURE")) {
+          sp.state = "FAILURE";
+          sp.status = "일부 지표 계산 실패";
+        } else if (states.some((s) => s === "PROGRESS" || s === "STARTED")) {
+          sp.state = "PROGRESS";
+          sp.status = "지표 계산 중...";
+        } else if (states.every((s) => s === "PENDING")) {
+          sp.state = "PENDING";
+          sp.status = "대기 중";
+        } else {
+          sp.state = "UNKNOWN";
+          sp.status = "-";
+        }
+
+        next[sym.symbol] = sp;
+      });
+
+      setIndicatorProgressMap(next);
+    } catch (err) {
+      console.error("Indicator progress 조회 실패:", err);
+      setIndicatorProgressMap({});
+    }
+  };
+
+  /* ======================================
+   * Pipeline Status polling
+   * ====================================== */
   useEffect(() => {
     if (isChecking || !isValid) return;
 
@@ -272,28 +418,29 @@ const AdminPage: React.FC = () => {
       }
     };
 
-    // 즉시 1회
     void fetchPipelineStatus();
 
-    // 폴링
     pipelinePollRef.current = setInterval(() => {
       if (!document.hidden) void fetchPipelineStatus();
     }, POLLING_INTERVAL);
 
     return () => {
-      if (pipelinePollRef.current)
-        clearInterval(pipelinePollRef.current);
+      if (pipelinePollRef.current) clearInterval(pipelinePollRef.current);
     };
   }, [isChecking, isValid]);
 
   // 인증 끝났을 때 Backfill polling 시작
   useEffect(() => {
     if (!isChecking && isValid) startBackfillPolling();
+
+    return () => {
+      if (backfillPollRef.current) clearInterval(backfillPollRef.current);
+    };
   }, [isChecking, isValid]);
 
-  // -----------------------------------------
-  // 버튼 핸들러
-  // -----------------------------------------
+  /* ======================================
+   * 버튼 핸들러
+   * ====================================== */
   const handleRegisterSymbols = async () => {
     setLoading(true);
     setRegisterMessage("");
@@ -345,12 +492,12 @@ const AdminPage: React.FC = () => {
     }
   };
 
-  // -----------------------------------------
-  // 리스트 렌더링용 rows
-  // -----------------------------------------
-  const rows = useMemo(
+  /* ======================================
+   * 리스트 렌더링용 rows
+   * ====================================== */
+  const backfillRows = useMemo(
     () =>
-      Object.entries(progressMap)
+      Object.entries(backfillProgressMap)
         .sort((a, b) => a[0].localeCompare(b[0]))
         .map(([symbol, p], idx) => ({
           idx: idx + 1,
@@ -358,7 +505,20 @@ const AdminPage: React.FC = () => {
           p,
           overallPct: computeOverallPct(p),
         })),
-    [progressMap]
+    [backfillProgressMap]
+  );
+
+  const indicatorRows = useMemo(
+    () =>
+      Object.entries(indicatorProgressMap)
+        .sort((a, b) => a[0].localeCompare(b[0]))
+        .map(([symbol, p], idx) => ({
+          idx: idx + 1,
+          symbol,
+          p,
+          overallPct: computeOverallPct(p),
+        })),
+    [indicatorProgressMap]
   );
 
   const scrollToTop = () =>
@@ -369,9 +529,9 @@ const AdminPage: React.FC = () => {
       behavior: "smooth",
     });
 
-  // -----------------------------------------
-  // 엔진 카드 렌더링 컴포넌트
-  // -----------------------------------------
+  /* ======================================
+   * 엔진 카드 렌더링
+   * ====================================== */
   const renderEngineCard = (
     label: string,
     data?: EngineStatus,
@@ -390,22 +550,30 @@ const AdminPage: React.FC = () => {
     return (
       <Wrapper
         onClick={onClick}
-        className={`bg-gray-900/60 border border-gray-700 rounded-md p-3 text-xs 
+        className={`bg-gray-900/60 border border-gray-700 rounded-md p-3 text-xs flex flex-col justify-between
         ${onClick ? "hover:border-cyan-400 cursor-pointer" : ""}`}
       >
-        <div className="flex items-center justify-between mb-1">
-          <span className="font-semibold text-gray-100">{label}</span>
-          <span className={`px-2 py-0.5 rounded-full border ${badgeClass}`}>
-            {st}
-          </span>
+        <div>
+          <div className="flex items-center justify-between mb-1">
+            <span className="font-semibold text-gray-100">{label}</span>
+            <span className={`px-2 py-0.5 rounded-full border ${badgeClass}`}>
+              {st}
+            </span>
+          </div>
+
+          <p className="text-[11px] text-gray-300 mb-1">
+            {data?.is_active ? "작업 활성화됨" : "작업 비활성"}
+          </p>
+
+          {data?.updated_at && (
+            <p className="text-[10px] text-gray-500">
+              업데이트: {data.updated_at}
+            </p>
+          )}
         </div>
 
-        <p className="text-[11px] text-gray-300 mb-1">
-          {data?.is_active ? "작업 활성화됨" : "작업 비활성"}
-        </p>
-
         {data?.last_error && (
-          <p className="text-[11px] text-red-400 break-words">
+          <p className="text-[11px] text-red-400 break-words mt-2">
             에러: {data.last_error}
           </p>
         )}
@@ -413,9 +581,9 @@ const AdminPage: React.FC = () => {
     );
   };
 
-  // -----------------------------------------
-  // 렌더링 시작
-  // -----------------------------------------
+  /* ======================================
+   * 렌더링 시작
+   * ====================================== */
   if (isChecking)
     return (
       <div className="flex items-center justify-center w-screen h-screen bg-gray-900 text-white">
@@ -426,13 +594,10 @@ const AdminPage: React.FC = () => {
 
   return (
     <div className="flex flex-col items-center w-screen min-h-screen p-6 md:p-8 bg-gray-900 text-white">
-      {/* =============================== */}
-      {/*        제목 & 기본 버튼          */}
-      {/* =============================== */}
+      {/* 1. 종목 정보 갱신 */}
       <h1 className="text-3xl font-bold mb-6">DB 관리</h1>
 
-      {/* 종목 정보 갱신 */}
-      <div className="bg-gray-800 p-6 rounded-lg w-full max-w-3xl text-center border border-gray-700 mb-6 sticky top-0">
+      <div className="bg-gray-800 p-6 rounded-lg w-full max-w-3xl text-center border border-gray-700 mb-6 sticky top-0 z-20">
         <h2 className="text-lg font-semibold mb-4 text-cyan-400">
           1. 종목 정보 갱신
         </h2>
@@ -456,9 +621,7 @@ const AdminPage: React.FC = () => {
         )}
       </div>
 
-      {/* =============================== */}
-      {/*     파이프라인 제어 패널         */}
-      {/* =============================== */}
+      {/* 2. 파이프라인 제어 패널 */}
       <div className="bg-gray-800 w-full max-w-5xl rounded-lg border border-gray-700">
         <div className="p-6 border-b border-gray-700 sticky top-[130px] bg-gray-800 z-10">
           <div className="flex items-center justify-between mb-3">
@@ -518,7 +681,11 @@ const AdminPage: React.FC = () => {
             )}
             {renderEngineCard(
               "보조지표 계산 엔진",
-              engineStatus.indicator
+              engineStatus.indicator,
+              async () => {
+                await fetchIndicatorProgress();
+                setShowIndicatorPanel(true);
+              }
             )}
           </div>
         </div>
@@ -540,30 +707,48 @@ const AdminPage: React.FC = () => {
                   /pipeline/backfill/progress
                 </p>
               </div>
-              <button
-                onClick={() => setShowBackfillPanel(false)}
-                className="px-3 py-1.5 rounded-md bg-red-600 hover:bg-red-500 text-xs"
-              >
-                닫기
-              </button>
+              <div className="flex items-center gap-2">
+                <button
+                  onClick={scrollToTop}
+                  className="px-3 py-1.5 rounded-md bg-gray-800 hover:bg-gray-700 text-xs text-gray-200"
+                >
+                  맨 위로
+                </button>
+                <button
+                  onClick={scrollToBottom}
+                  className="px-3 py-1.5 rounded-md bg-gray-800 hover:bg-gray-700 text-xs text-gray-200"
+                >
+                  맨 아래로
+                </button>
+                <button
+                  onClick={() => setShowBackfillPanel(false)}
+                  className="px-3 py-1.5 rounded-md bg-red-600 hover:bg-red-500 text-xs"
+                >
+                  닫기
+                </button>
+              </div>
             </div>
 
             {/* Body */}
-            <div
-              ref={listContainerRef}
-              className="px-4 py-4 overflow-y-auto"
-            >
-              {rows.length === 0 ? (
+            <div ref={listContainerRef} className="px-4 py-4 overflow-y-auto">
+              {backfillRows.length === 0 ? (
                 <p className="text-sm text-gray-400 text-center py-6">
                   진행 중인 Backfill 없음
                 </p>
               ) : (
-                rows.map(({ symbol, p, overallPct }) => (
+                backfillRows.map(({ symbol, p, overallPct }) => (
                   <div
                     key={symbol}
                     className="p-4 mb-4 rounded-lg border border-gray-700 bg-gray-800"
                   >
-                    <h3 className="text-lg font-semibold mb-2">{symbol}</h3>
+                    <div className="flex items-center justify-between mb-1">
+                      <h3 className="text-lg font-semibold">{symbol}</h3>
+                      <span className="text-xs text-gray-300">{p.state}</span>
+                    </div>
+
+                    <p className="text-xs text-gray-400 mb-2">
+                      {p.status || "-"}
+                    </p>
 
                     <div className="mb-2">
                       <div className="text-xs mb-1">
@@ -639,10 +824,7 @@ const AdminPage: React.FC = () => {
             </div>
 
             {/* Body */}
-            <div
-              ref={restListRef}
-              className="px-4 py-4 overflow-y-auto"
-            >
+            <div ref={restListRef} className="px-4 py-4 overflow-y-auto">
               {restProgress.length === 0 ? (
                 <p className="text-sm text-gray-400 text-center py-6">
                   유지보수 대상 없음 (SUCCESS)
@@ -664,18 +846,131 @@ const AdminPage: React.FC = () => {
                           color = "text-green-400";
                         else if (iv.state === "FAILURE")
                           color = "text-red-400";
+                        else if (iv.state === "PROGRESS")
+                          color = "text-blue-400";
 
                         return (
                           <div
                             key={iv.interval}
                             className="p-2 border border-gray-700 rounded bg-gray-900"
                           >
-                            <span className="text-xs text-gray-400">
-                              {iv.interval}
-                            </span>
-                            <div className={`text-sm font-semibold ${color}`}>
-                              {iv.state}
+                            <div className="flex items-center justify-between mb-1">
+                              <span className="text-xs text-gray-400">
+                                {iv.interval}
+                              </span>
+                              <span className={`text-xs font-semibold ${color}`}>
+                                {iv.state}
+                              </span>
                             </div>
+                            {iv.updated_at && (
+                              <div className="text-[10px] text-gray-500">
+                                {iv.updated_at}
+                              </div>
+                            )}
+                          </div>
+                        );
+                      })}
+                    </div>
+                  </div>
+                ))
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* =============================== */}
+      {/*   Indicator 진행현황 모달        */}
+      {/* =============================== */}
+      {showIndicatorPanel && (
+        <div className="fixed inset-0 z-40 flex items-center justify-center bg-black/60">
+          <div className="bg-gray-900 w-[95vw] max-w-5xl max-h-[85vh] rounded-lg border border-gray-700 flex flex-col">
+            {/* Header */}
+            <div className="flex items-center justify-between px-4 py-3 border-b border-gray-700">
+              <div>
+                <h3 className="text-lg font-semibold text-yellow-300">
+                  보조지표 계산 진행현황
+                </h3>
+                <p className="text-xs text-gray-400">
+                  /pipeline/indicator/progress
+                </p>
+              </div>
+              <button
+                onClick={() => setShowIndicatorPanel(false)}
+                className="px-3 py-1.5 rounded-md bg-red-600 hover:bg-red-500 text-xs"
+              >
+                닫기
+              </button>
+            </div>
+
+            {/* Body */}
+            <div
+              ref={indicatorListRef}
+              className="px-4 py-4 overflow-y-auto"
+            >
+              {indicatorRows.length === 0 ? (
+                <p className="text-sm text-gray-400 text-center py-6">
+                  진행 중인 보조지표 계산 작업이 없습니다.
+                </p>
+              ) : (
+                indicatorRows.map(({ symbol, p, overallPct }) => (
+                  <div
+                    key={symbol}
+                    className="p-4 mb-4 rounded-lg border border-gray-700 bg-gray-800"
+                  >
+                    <div className="flex items-center justify-between mb-1">
+                      <h3 className="text-lg font-semibold">{symbol}</h3>
+                      <span className="text-xs text-gray-300">
+                        {p.state}
+                      </span>
+                    </div>
+
+                    <p className="text-xs text-gray-400 mb-2">
+                      {p.status || "-"}
+                    </p>
+
+                    <div className="mb-2">
+                      <div className="text-xs mb-1">
+                        전체 진행률: {overallPct}%
+                      </div>
+                      <div className="w-full bg-gray-700 h-2 rounded-full">
+                        <div
+                          className="bg-yellow-400 h-2 rounded-full"
+                          style={{ width: `${overallPct}%` }}
+                        ></div>
+                      </div>
+                    </div>
+
+                    {/* Interval details */}
+                    <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-2">
+                      {INTERVAL_ORDER.map((iv) => {
+                        const ivp = p.intervals[iv];
+                        const state = ivp?.state || "PENDING";
+
+                        return (
+                          <div
+                            key={iv}
+                            className="p-2 border border-gray-700 rounded-md bg-gray-900"
+                          >
+                            <div className="text-xs text-gray-300 mb-1 flex justify-between">
+                              <span>{iv}</span>
+                              <span>{state}</span>
+                            </div>
+                            <div className="w-full bg-gray-700 h-2 rounded-full">
+                              <div
+                                className="bg-yellow-400 h-2 rounded-full"
+                                style={{
+                                  width: `${
+                                    ivp ? clampPct(ivp.pct_time) : 0
+                                  }%`,
+                                }}
+                              />
+                            </div>
+                            {ivp?.last_updated_iso && (
+                              <div className="text-[10px] text-gray-500 mt-1">
+                                {ivp.last_updated_iso}
+                              </div>
+                            )}
                           </div>
                         );
                       })}
