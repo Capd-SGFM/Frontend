@@ -676,37 +676,35 @@ const AdminPage: React.FC = () => {
       badgeClass = "text-red-300 border-red-400";
 
     const Wrapper: any = onClick ? "button" : "div";
+    const hasError = !!data?.last_error;
 
     return (
       <Wrapper
         onClick={onClick}
-        className={`bg-gray-900/60 border border-gray-700 rounded-md p-3 text-xs flex flex-col justify-between
+        className={`bg-gray-900/60 border border-gray-700 rounded-md p-3 text-xs flex flex-col justify-between h-full
         ${onClick ? "hover:border-cyan-400 cursor-pointer" : ""}`}
       >
-        <div>
-          <div className="flex items-center justify-between mb-1">
+        <div className="w-full">
+          <div className="flex items-center justify-between mb-3">
             <span className="font-semibold text-gray-100">{label}</span>
             <span className={`px-2 py-0.5 rounded-full border ${badgeClass}`}>
               {st}
             </span>
           </div>
 
-          <p className="text-[11px] text-gray-300 mb-1">
-            {data?.is_active ? "작업 활성화됨" : "작업 비활성"}
-          </p>
-
-          {data?.updated_at && (
-            <p className="text-[10px] text-gray-500">
-              업데이트: {data.updated_at}
-            </p>
-          )}
+          {/* ERROR LOG Status Badge */}
+          <div className="flex items-center">
+            <span
+              className={`px-2 py-1 rounded border text-[10px] font-bold ${
+                hasError
+                  ? "bg-red-900/30 text-red-400 border-red-500/50"
+                  : "bg-gray-800 text-gray-500 border-gray-600"
+              }`}
+            >
+              ERROR LOG
+            </span>
+          </div>
         </div>
-
-        {data?.last_error && (
-          <p className="text-[11px] text-red-400 break-words mt-2">
-            에러: {data.last_error}
-          </p>
-        )}
       </Wrapper>
     );
   };
