@@ -113,6 +113,42 @@ interface IndicatorProgressApiResponse {
   symbols: Record<string, IndicatorSymbolApi>;
 }
 
+/* ===========================
+ *  WebSocket 진행률 API 타입
+ *  (백엔드: { run_id, symbols: { [symbol]: { symbol, intervals: { [interval]: {interval, state, message_count, last_message_ts, last_error} } } } })
+ * =========================== */
+interface WebSocketIntervalApi {
+  interval: string;
+  state: string;
+  message_count: number;
+  last_message_ts: string | null;
+  last_error: string | null;
+}
+
+interface WebSocketSymbolApi {
+  symbol: string;
+  intervals: Record<string, WebSocketIntervalApi>;
+}
+
+interface WebSocketProgressApiResponse {
+  run_id: string | null;
+  symbols: Record<string, WebSocketSymbolApi>;
+}
+
+/* WebSocket UI용 변환 타입 */
+interface WebSocketIntervalState {
+  interval: IntervalKey;
+  state: "CONNECTED" | "DISCONNECTED" | "ERROR" | "UNKNOWN";
+  message_count: number;
+  last_message_ts?: string | null;
+  last_error?: string | null;
+}
+
+interface WebSocketSymbolState {
+  symbol: string;
+  intervals: WebSocketIntervalState[];
+}
+
 // --- 공통 UI 상태 타입 ---
 interface IntervalProgress {
   interval: IntervalKey;
@@ -191,12 +227,17 @@ const AdminPage: React.FC = () => {
   >({});
   const [showIndicatorPanel, setShowIndicatorPanel] = useState(false);
 
+  // WebSocket 진행률
+  const [websocketProgress, setWebsocketProgress] = useState<WebSocketSymbolState[]>([]);
+  const [showWebsocketPanel, setShowWebsocketPanel] = useState(false);
+
   const backfillPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const pipelinePollRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   const listContainerRef = useRef<HTMLDivElement | null>(null);
   const restListRef = useRef<HTMLDivElement | null>(null);
   const indicatorListRef = useRef<HTMLDivElement | null>(null);
+  const websocketListRef = useRef<HTMLDivElement | null>(null);
 
   const isPipelineActive = pipelineActive === true;
   const [showBackfillPanel, setShowBackfillPanel] = useState(false);
@@ -388,6 +429,48 @@ const AdminPage: React.FC = () => {
   };
 
   /* ======================================
+   * WebSocket Progress (클릭 시 조회)
+   * ====================================== */
+  const fetchWebsocketProgress = async () => {
+    try {
+      const res = await api.get<WebSocketProgressApiResponse>(
+        "/pipeline/websocket/progress"
+      );
+      const data = res.data;
+
+      if (!data.run_id || !data.symbols) {
+        setWebsocketProgress([]);
+        return;
+      }
+
+      const items: WebSocketSymbolState[] = [];
+
+      Object.values(data.symbols).forEach((sym: WebSocketSymbolApi) => {
+        const intervals: WebSocketIntervalState[] = [];
+
+        Object.values(sym.intervals).forEach((iv: WebSocketIntervalApi) => {
+          const interval = iv.interval as IntervalKey;
+          intervals.push({
+            interval,
+            state: (iv.state as any) || "UNKNOWN",
+            message_count: iv.message_count || 0,
+            last_message_ts: iv.last_message_ts,
+            last_error: iv.last_error,
+          });
+        });
+
+        items.push({ symbol: sym.symbol, intervals });
+      });
+
+      setWebsocketProgress(items);
+    } catch (err) {
+      console.error("WebSocket progress 조회 실패:", err);
+      setWebsocketProgress([]);
+    }
+  };
+
+
+  /* ======================================
    * Pipeline Status polling
    * ====================================== */
   useEffect(() => {
@@ -437,6 +520,45 @@ const AdminPage: React.FC = () => {
       if (backfillPollRef.current) clearInterval(backfillPollRef.current);
     };
   }, [isChecking, isValid]);
+
+  // REST 모달이 열려있을 때 폴링
+  useEffect(() => {
+    if (!showRestPanel) return;
+
+    void fetchRestProgress(); // 초기 데이터 가져오기
+
+    const pollRef = setInterval(() => {
+      if (!document.hidden) void fetchRestProgress();
+    }, POLLING_INTERVAL);
+
+    return () => clearInterval(pollRef);
+  }, [showRestPanel]);
+
+  // Indicator 모달이 열려있을 때 폴링
+  useEffect(() => {
+    if (!showIndicatorPanel) return;
+
+    void fetchIndicatorProgress(); // 초기 데이터 가져오기
+
+    const pollRef = setInterval(() => {
+      if (!document.hidden) void fetchIndicatorProgress();
+    }, POLLING_INTERVAL);
+
+    return () => clearInterval(pollRef);
+  }, [showIndicatorPanel]);
+
+  // WebSocket 모달이 열려있을 때 폴링
+  useEffect(() => {
+    if (!showWebsocketPanel) return;
+
+    void fetchWebsocketProgress(); // 초기 데이터 가져오기
+
+    const pollRef = setInterval(() => {
+      if (!document.hidden) void fetchWebsocketProgress();
+    }, POLLING_INTERVAL);
+
+    return () => clearInterval(pollRef);
+  }, [showWebsocketPanel]);
 
   /* ======================================
    * 버튼 핸들러
@@ -665,7 +787,11 @@ const AdminPage: React.FC = () => {
 
           {/* 엔진 카드 4개 */}
           <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-3">
-            {renderEngineCard("WebSocket 실시간", engineStatus.websocket)}
+            {renderEngineCard(
+              "WebSocket 실시간",
+              engineStatus.websocket,
+              () => setShowWebsocketPanel(true)
+            )}
             {renderEngineCard(
               "Backfill 엔진",
               engineStatus.backfill,
@@ -674,18 +800,12 @@ const AdminPage: React.FC = () => {
             {renderEngineCard(
               "REST 유지보수 엔진",
               engineStatus.rest_maintenance,
-              async () => {
-                await fetchRestProgress();
-                setShowRestPanel(true);
-              }
+              () => setShowRestPanel(true)
             )}
             {renderEngineCard(
               "보조지표 계산 엔진",
               engineStatus.indicator,
-              async () => {
-                await fetchIndicatorProgress();
-                setShowIndicatorPanel(true);
-              }
+              () => setShowIndicatorPanel(true)
             )}
           </div>
         </div>
@@ -969,6 +1089,99 @@ const AdminPage: React.FC = () => {
                             {ivp?.last_updated_iso && (
                               <div className="text-[10px] text-gray-500 mt-1">
                                 {ivp.last_updated_iso}
+                              </div>
+                            )}
+                          </div>
+                        );
+                      })}
+                    </div>
+                  </div>
+                ))
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* =============================== */}
+      {/*   WebSocket 연결 상태 모달      */}
+      {/* =============================== */}
+      {showWebsocketPanel && (
+        <div className="fixed inset-0 z-40 flex items-center justify-center bg-black/60">
+          <div className="bg-gray-900 w-[90vw] max-w-3xl max-h-[80vh] rounded-lg border border-gray-700 flex flex-col">
+            {/* Header */}
+            <div className="flex items-center justify-between px-4 py-3 border-b border-gray-700">
+              <div>
+                <h3 className="text-lg font-semibold text-purple-300">
+                  WebSocket 실시간 연결 상태
+                </h3>
+                <p className="text-xs text-gray-400">
+                  /pipeline/websocket/progress
+                </p>
+              </div>
+              <button
+                onClick={() => setShowWebsocketPanel(false)}
+                className="px-3 py-1.5 rounded-md bg-red-600 hover:bg-red-500 text-xs"
+              >
+                닫기
+              </button>
+            </div>
+
+            {/* Body */}
+            <div ref={websocketListRef} className="px-4 py-4 overflow-y-auto">
+              {websocketProgress.length === 0 ? (
+                <p className="text-sm text-gray-400 text-center py-6">
+                  WebSocket 연결 정보 없음
+                </p>
+              ) : (
+                websocketProgress.map((row) => (
+                  <div
+                    key={row.symbol}
+                    className="p-3 mb-3 rounded-lg border border-gray-700 bg-gray-800"
+                  >
+                    <h3 className="text-md font-bold mb-2 text-white">
+                      {row.symbol}
+                    </h3>
+
+                    <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-2">
+                      {row.intervals.map((iv) => {
+                        let color = "text-gray-300";
+                        let bgColor = "bg-gray-900";
+                        if (iv.state === "CONNECTED") {
+                          color = "text-green-400";
+                          bgColor = "bg-green-900/20";
+                        } else if (iv.state === "ERROR") {
+                          color = "text-red-400";
+                          bgColor = "bg-red-900/20";
+                        } else if (iv.state === "DISCONNECTED") {
+                          color = "text-gray-400";
+                          bgColor = "bg-gray-900";
+                        }
+
+                        return (
+                          <div
+                            key={iv.interval}
+                            className={`p-2 border border-gray-700 rounded ${bgColor}`}
+                          >
+                            <div className="flex items-center justify-between mb-1">
+                              <span className="text-xs text-gray-400">
+                                {iv.interval}
+                              </span>
+                              <span className={`text-xs font-semibold ${color}`}>
+                                {iv.state}
+                              </span>
+                            </div>
+                            <div className="text-[10px] text-gray-500">
+                              메시지: {iv.message_count.toLocaleString()}개
+                            </div>
+                            {iv.last_message_ts && (
+                              <div className="text-[10px] text-gray-500">
+                                최근: {new Date(iv.last_message_ts).toLocaleTimeString()}
+                              </div>
+                            )}
+                            {iv.last_error && (
+                              <div className="text-[10px] text-red-400 mt-1 truncate">
+                                에러: {iv.last_error}
                               </div>
                             )}
                           </div>
