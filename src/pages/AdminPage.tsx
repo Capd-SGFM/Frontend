@@ -10,9 +10,9 @@ type CeleryState =
   | "STARTED"
   | "UNKNOWN";
 
-// interval 축소 버전
-type IntervalKey = "1h" | "4h" | "1d" | "1w" | "1M";
-const INTERVAL_ORDER: IntervalKey[] = ["1h", "4h", "1d", "1w", "1M"];
+// interval 전체 버전 (분 단위 포함)
+type IntervalKey = "1m" | "3m" | "5m" | "15m" | "30m" | "1h" | "4h" | "1d" | "1w" | "1M";
+const INTERVAL_ORDER: IntervalKey[] = ["1m", "3m", "5m", "15m", "30m", "1h", "4h", "1d", "1w", "1M"];
 
 // --- 파이프라인 상태(엔진 4개) 타입 ---
 type EngineStatusState =
@@ -47,6 +47,7 @@ interface BackfillIntervalApi {
   state: string;
   pct_time: number;
   last_updated_iso: string | null;
+  last_error: string | null;
 }
 
 interface BackfillSymbolApi {
@@ -68,6 +69,7 @@ interface RestIntervalApi {
   interval: string;
   state: string;
   updated_at: string | null;
+  last_error: string | null;
 }
 
 interface RestSymbolApi {
@@ -85,6 +87,7 @@ interface RestIntervalState {
   interval: IntervalKey;
   state: "PENDING" | "SUCCESS" | "FAILURE" | "PROGRESS" | "UNKNOWN";
   updated_at?: string | null;
+  last_error?: string | null;
 }
 
 interface RestSymbolState {
@@ -101,6 +104,7 @@ interface IndicatorIntervalApi {
   state: string;
   pct_time: number;
   updated_at: string | null;
+  last_error: string | null;
 }
 
 interface IndicatorSymbolApi {
@@ -155,6 +159,7 @@ interface IntervalProgress {
   state: CeleryState;
   pct_time: number;
   last_updated_iso?: string | null;
+  last_error?: string | null;
 }
 
 interface SymbolProgress {
@@ -269,6 +274,7 @@ const AdminPage: React.FC = () => {
             state: (row.state as CeleryState) || "UNKNOWN",
             pct_time: clampPct(row.pct_time),
             last_updated_iso: row.last_updated_iso,
+            last_error: row.last_error,
           };
         }
 
@@ -346,6 +352,7 @@ const AdminPage: React.FC = () => {
             interval,
             state: (iv.state as any) || "UNKNOWN",
             updated_at: iv.updated_at,
+            last_error: (iv as any).last_error,
           });
         });
 
@@ -386,6 +393,7 @@ const AdminPage: React.FC = () => {
             state: (iv.state as CeleryState) || "UNKNOWN",
             pct_time: clampPct(iv.pct_time),
             last_updated_iso: iv.updated_at,
+            last_error: (iv as any).last_error,
           };
         });
 
@@ -851,6 +859,56 @@ const AdminPage: React.FC = () => {
 
             {/* Body */}
             <div ref={listContainerRef} className="px-4 py-4 overflow-y-auto">
+              {/* Error Log Section - Always displayed */}
+              {(() => {
+                const errors: Array<{ symbol: string; interval: string; error: string }> = [];
+                
+                backfillRows.forEach(({ symbol, p }) => {
+                  INTERVAL_ORDER.forEach(iv => {
+                    const ivp = p.intervals[iv];
+                    if (ivp?.last_error) {
+                      errors.push({ symbol, interval: iv, error: ivp.last_error });
+                    }
+                  });
+                });
+                
+                const hasErrors = errors.length > 0;
+                
+                return (
+                  <div className={`mb-4 p-3 rounded-lg border ${
+                    hasErrors 
+                      ? "bg-red-900/20 border-red-500/50" 
+                      : "bg-gray-800/50 border-gray-600/50"
+                  }`}>
+                    <h4 className={`text-sm font-bold mb-2 flex items-center gap-2 ${
+                      hasErrors ? "text-red-400" : "text-gray-400"
+                    }`}>
+                      <span>ERROR LOG</span>
+                      <span className={`px-2 py-0.5 text-white text-xs rounded-full ${
+                        hasErrors ? "bg-red-500" : "bg-gray-500"
+                      }`}>
+                        {errors.length}
+                      </span>
+                    </h4>
+                    {hasErrors ? (
+                      <div className="space-y-2">
+                        {errors.map((err, idx) => (
+                          <div key={idx} className="p-2 bg-gray-800/50 rounded border border-gray-700">
+                            <div className="flex items-center gap-2 mb-1">
+                              <span className="text-xs font-semibold text-white">{err.symbol}</span>
+                              <span className="text-xs text-gray-400">{err.interval}</span>
+                            </div>
+                            <p className="text-xs text-red-300 break-words">{err.error}</p>
+                          </div>
+                        ))}
+                      </div>
+                    ) : (
+                      <p className="text-xs text-gray-500">No Errors</p>
+                    )}
+                  </div>
+                );
+              })()}
+
               {backfillRows.length === 0 ? (
                 <p className="text-sm text-gray-400 text-center py-6">
                   진행 중인 Backfill 없음
@@ -945,6 +1003,51 @@ const AdminPage: React.FC = () => {
 
             {/* Body */}
             <div ref={restListRef} className="px-4 py-4 overflow-y-auto">
+              {/* Error Log Section - Always displayed */}
+              {(() => {
+                const errors = restProgress.flatMap(row => 
+                  row.intervals
+                    .filter(iv => iv.last_error)
+                    .map(iv => ({ symbol: row.symbol, interval: iv.interval, error: iv.last_error! }))
+                );
+                
+                const hasErrors = errors.length > 0;
+                
+                return (
+                  <div className={`mb-4 p-3 rounded-lg border ${
+                    hasErrors 
+                      ? "bg-red-900/20 border-red-500/50" 
+                      : "bg-gray-800/50 border-gray-600/50"
+                  }`}>
+                    <h4 className={`text-sm font-bold mb-2 flex items-center gap-2 ${
+                      hasErrors ? "text-red-400" : "text-gray-400"
+                    }`}>
+                      <span>ERROR LOG</span>
+                      <span className={`px-2 py-0.5 text-white text-xs rounded-full ${
+                        hasErrors ? "bg-red-500" : "bg-gray-500"
+                      }`}>
+                        {errors.length}
+                      </span>
+                    </h4>
+                    {hasErrors ? (
+                      <div className="space-y-2">
+                        {errors.map((err, idx) => (
+                          <div key={idx} className="p-2 bg-gray-800/50 rounded border border-gray-700">
+                            <div className="flex items-center gap-2 mb-1">
+                              <span className="text-xs font-semibold text-white">{err.symbol}</span>
+                              <span className="text-xs text-gray-400">{err.interval}</span>
+                            </div>
+                            <p className="text-xs text-red-300 break-words">{err.error}</p>
+                          </div>
+                        ))}
+                      </div>
+                    ) : (
+                      <p className="text-xs text-gray-500">No Errors</p>
+                    )}
+                  </div>
+                );
+              })()}
+
               {restProgress.length === 0 ? (
                 <p className="text-sm text-gray-400 text-center py-6">
                   유지보수 대상 없음 (SUCCESS)
@@ -1028,6 +1131,56 @@ const AdminPage: React.FC = () => {
               ref={indicatorListRef}
               className="px-4 py-4 overflow-y-auto"
             >
+              {/* Error Log Section - Always displayed */}
+              {(() => {
+                const errors: Array<{ symbol: string; interval: string; error: string }> = [];
+                
+                indicatorRows.forEach(({ symbol, p }) => {
+                  INTERVAL_ORDER.forEach(iv => {
+                    const ivp = p.intervals[iv];
+                    if (ivp?.last_error) {
+                      errors.push({ symbol, interval: iv, error: ivp.last_error });
+                    }
+                  });
+                });
+                
+                const hasErrors = errors.length > 0;
+                
+                return (
+                  <div className={`mb-4 p-3 rounded-lg border ${
+                    hasErrors 
+                      ? "bg-red-900/20 border-red-500/50" 
+                      : "bg-gray-800/50 border-gray-600/50"
+                  }`}>
+                    <h4 className={`text-sm font-bold mb-2 flex items-center gap-2 ${
+                      hasErrors ? "text-red-400" : "text-gray-400"
+                    }`}>
+                      <span>ERROR LOG</span>
+                      <span className={`px-2 py-0.5 text-white text-xs rounded-full ${
+                        hasErrors ? "bg-red-500" : "bg-gray-500"
+                      }`}>
+                        {errors.length}
+                      </span>
+                    </h4>
+                    {hasErrors ? (
+                      <div className="space-y-2">
+                        {errors.map((err, idx) => (
+                          <div key={idx} className="p-2 bg-gray-800/50 rounded border border-gray-700">
+                            <div className="flex items-center gap-2 mb-1">
+                              <span className="text-xs font-semibold text-white">{err.symbol}</span>
+                              <span className="text-xs text-gray-400">{err.interval}</span>
+                            </div>
+                            <p className="text-xs text-red-300 break-words">{err.error}</p>
+                          </div>
+                        ))}
+                      </div>
+                    ) : (
+                      <p className="text-xs text-gray-500">No Errors</p>
+                    )}
+                  </div>
+                );
+              })()}
+
               {indicatorRows.length === 0 ? (
                 <p className="text-sm text-gray-400 text-center py-6">
                   진행 중인 보조지표 계산 작업이 없습니다.
@@ -1129,6 +1282,51 @@ const AdminPage: React.FC = () => {
 
             {/* Body */}
             <div ref={websocketListRef} className="px-4 py-4 overflow-y-auto">
+              {/* Error Log Section - Always displayed */}
+              {(() => {
+                const errors = websocketProgress.flatMap(row => 
+                  row.intervals
+                    .filter(iv => iv.last_error)
+                    .map(iv => ({ symbol: row.symbol, interval: iv.interval, error: iv.last_error! }))
+                );
+                
+                const hasErrors = errors.length > 0;
+                
+                return (
+                  <div className={`mb-4 p-3 rounded-lg border ${
+                    hasErrors 
+                      ? "bg-red-900/20 border-red-500/50" 
+                      : "bg-gray-800/50 border-gray-600/50"
+                  }`}>
+                    <h4 className={`text-sm font-bold mb-2 flex items-center gap-2 ${
+                      hasErrors ? "text-red-400" : "text-gray-400"
+                    }`}>
+                      <span>ERROR LOG</span>
+                      <span className={`px-2 py-0.5 text-white text-xs rounded-full ${
+                        hasErrors ? "bg-red-500" : "bg-gray-500"
+                      }`}>
+                        {errors.length}
+                      </span>
+                    </h4>
+                    {hasErrors ? (
+                      <div className="space-y-2">
+                        {errors.map((err, idx) => (
+                          <div key={idx} className="p-2 bg-gray-800/50 rounded border border-gray-700">
+                            <div className="flex items-center gap-2 mb-1">
+                              <span className="text-xs font-semibold text-white">{err.symbol}</span>
+                              <span className="text-xs text-gray-400">{err.interval}</span>
+                            </div>
+                            <p className="text-xs text-red-300 break-words">{err.error}</p>
+                          </div>
+                        ))}
+                      </div>
+                    ) : (
+                      <p className="text-xs text-gray-500">No Errors</p>
+                    )}
+                  </div>
+                );
+              })()}
+
               {websocketProgress.length === 0 ? (
                 <p className="text-sm text-gray-400 text-center py-6">
                   WebSocket 연결 정보 없음
