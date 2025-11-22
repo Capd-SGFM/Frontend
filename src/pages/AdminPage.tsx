@@ -128,7 +128,6 @@ interface WebSocketIntervalApi {
   last_message_ts: string | null;
   last_error: string | null;
 }
-
 interface WebSocketSymbolApi {
   symbol: string;
   intervals: Record<string, WebSocketIntervalApi>;
@@ -169,6 +168,34 @@ interface SymbolProgress {
   intervals: Partial<Record<IntervalKey, IntervalProgress>>;
 }
 
+/* ===========================
+ *  Verification API Types
+ * =========================== */
+interface VerificationResult {
+  symbol: string;
+  interval: string;
+  status: "OK" | "WARNING" | "EMPTY";
+  details: string[];
+  ohlcv: {
+    count?: number;
+    expected?: number;
+    min_ts?: string;
+    max_ts?: string;
+    gap?: number;
+  };
+  indicator: {
+    count?: number;
+    min_ts?: string;
+    max_ts?: string;
+  };
+}
+
+interface VerificationResponse {
+  timestamp: string;
+  total_items: number;
+  results: VerificationResult[];
+}
+
 const API_URL =
   (import.meta as any).env?.VITE_BACKEND_URL || "http://localhost:8080";
 
@@ -199,6 +226,15 @@ function computeOverallPct(p: SymbolProgress): number {
 
   const sum = percentages.reduce((a, b) => a + b, 0);
   return Math.round(sum / percentages.length);
+}
+
+interface ErrorLogItem {
+  id: number;
+  component: string;
+  symbol: string | null;
+  interval: string | null;
+  error_message: string;
+  occurred_at: string;
 }
 
 const AdminPage: React.FC = () => {
@@ -235,6 +271,15 @@ const AdminPage: React.FC = () => {
   // WebSocket 진행률
   const [websocketProgress, setWebsocketProgress] = useState<WebSocketSymbolState[]>([]);
   const [showWebsocketPanel, setShowWebsocketPanel] = useState(false);
+
+  // Error Log Modal
+  const [showErrorLogModal, setShowErrorLogModal] = useState(false);
+  const [currentErrors, setCurrentErrors] = useState<ErrorLogItem[]>([]);
+
+  // Verification
+  const [verificationResults, setVerificationResults] = useState<VerificationResult[]>([]);
+  const [showVerificationPanel, setShowVerificationPanel] = useState(false);
+  const [verifying, setVerifying] = useState(false);
 
   const backfillPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const pipelinePollRef = useRef<ReturnType<typeof setInterval> | null>(null);
@@ -569,6 +614,48 @@ const AdminPage: React.FC = () => {
   }, [showWebsocketPanel]);
 
   /* ======================================
+   * Error Log Polling
+   * ====================================== */
+  const fetchCurrentErrors = async () => {
+    try {
+      const res = await api.get<ErrorLogItem[]>("/pipeline/errors/current");
+      setCurrentErrors(res.data);
+    } catch (err) {
+      console.error("에러 로그 조회 실패:", err);
+    }
+  };
+
+  useEffect(() => {
+    if (!showErrorLogModal) return;
+
+    void fetchCurrentErrors();
+    const pollRef = setInterval(() => {
+      if (!document.hidden) void fetchCurrentErrors();
+    }, POLLING_INTERVAL);
+
+    return () => clearInterval(pollRef);
+  }, [showErrorLogModal]);
+
+  /* ======================================
+   * Verification Handler
+   * ====================================== */
+  const handleVerifyIntegrity = async () => {
+    setVerifying(true);
+    try {
+      // 데이터 양이 많을 수 있으므로 타임아웃을 2분(120초)으로 연장
+      const res = await api.get<VerificationResponse>("/verification/integrity", {
+        timeout: 120000 
+      });
+      setVerificationResults(res.data.results);
+      setShowVerificationPanel(true);
+    } catch (err: any) {
+      alert("검증 실패: " + (err.message || ""));
+    } finally {
+      setVerifying(false);
+    }
+  };
+
+  /* ======================================
    * 버튼 핸들러
    * ====================================== */
   const handleRegisterSymbols = async () => {
@@ -789,6 +876,13 @@ const AdminPage: React.FC = () => {
                 ? "데이터 수집 파이프라인 OFF"
                 : "데이터 수집 파이프라인 ON"}
             </button>
+
+            <button
+              onClick={() => setShowErrorLogModal(true)}
+              className="px-4 py-2 rounded-md font-semibold bg-gray-700 hover:bg-gray-600 text-gray-200"
+            >
+              에러 로그 보기
+            </button>
           </div>
 
           {/* 엔진 카드 4개 */}
@@ -816,6 +910,103 @@ const AdminPage: React.FC = () => {
           </div>
         </div>
       </div>
+
+      {/* 3. 데이터 무결성 검증 */}
+      <div className="bg-gray-800 w-full max-w-5xl rounded-lg border border-gray-700 mt-6">
+        <div className="p-6">
+          <h2 className="text-lg font-semibold text-purple-400 mb-4">
+            3. 데이터 무결성 검증
+          </h2>
+          <p className="text-sm text-gray-400 mb-4">
+            모든 종목과 인터벌에 대해 데이터 연속성(Gap)과 보조지표 동기화 여부를 확인합니다.
+          </p>
+          <button
+            onClick={handleVerifyIntegrity}
+            disabled={verifying}
+            className="px-4 py-2 rounded-md bg-purple-600 hover:bg-purple-500 font-semibold disabled:opacity-50"
+          >
+            {verifying ? "검증 중..." : "무결성 검증 시작"}
+          </button>
+        </div>
+      </div>
+
+      {/* =============================== */}
+      {/*      Verification 모달          */}
+      {/* =============================== */}
+      {showVerificationPanel && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60">
+          <div className="bg-gray-900 w-[95vw] max-w-6xl max-h-[85vh] rounded-lg border border-gray-700 flex flex-col">
+            <div className="flex items-center justify-between px-4 py-3 border-b border-gray-700">
+              <div>
+                <h3 className="text-lg font-semibold text-purple-300">
+                  데이터 무결성 검증 결과
+                </h3>
+                <p className="text-xs text-gray-400">
+                  /verification/integrity
+                </p>
+              </div>
+              <button
+                onClick={() => setShowVerificationPanel(false)}
+                className="px-3 py-1.5 rounded-md bg-red-600 hover:bg-red-500 text-xs"
+              >
+                닫기
+              </button>
+            </div>
+            <div className="flex-1 overflow-auto p-4">
+              <table className="w-full text-left text-xs text-gray-300">
+                <thead className="text-gray-500 border-b border-gray-700 bg-gray-800 sticky top-0">
+                  <tr>
+                    <th className="p-2">Symbol</th>
+                    <th className="p-2">Interval</th>
+                    <th className="p-2">Status</th>
+                    <th className="p-2">Details</th>
+                    <th className="p-2">OHLCV (Count / Expected)</th>
+                    <th className="p-2">Indicator (Count)</th>
+                    <th className="p-2">Range (Max TS)</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {verificationResults.map((row, idx) => {
+                    let statusColor = "text-gray-400";
+                    if (row.status === "OK") statusColor = "text-green-400";
+                    else if (row.status === "WARNING") statusColor = "text-yellow-400";
+                    else if (row.status === "EMPTY") statusColor = "text-gray-500";
+
+                    return (
+                      <tr key={idx} className="border-b border-gray-800 hover:bg-gray-800/50">
+                        <td className="p-2 font-semibold">{row.symbol}</td>
+                        <td className="p-2">{row.interval}</td>
+                        <td className={`p-2 font-bold ${statusColor}`}>{row.status}</td>
+                        <td className="p-2 text-red-300">
+                          {row.details.length > 0 ? (
+                            <ul className="list-disc list-inside">
+                              {row.details.map((d, i) => <li key={i}>{d}</li>)}
+                            </ul>
+                          ) : "-"}
+                        </td>
+                        <td className="p-2">
+                          {row.ohlcv.count ? (
+                            <span>
+                              {row.ohlcv.count.toLocaleString()} / {row.ohlcv.expected?.toLocaleString()}
+                              {row.ohlcv.gap ? <span className="text-red-400 ml-1">(-{row.ohlcv.gap})</span> : ""}
+                            </span>
+                          ) : "-"}
+                        </td>
+                        <td className="p-2">
+                          {row.indicator.count ? row.indicator.count.toLocaleString() : "-"}
+                        </td>
+                        <td className="p-2 text-gray-500">
+                          {row.ohlcv.max_ts ? new Date(row.ohlcv.max_ts).toLocaleString() : "-"}
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* =============================== */}
       {/*      Backfill 모달 창           */}
@@ -1386,6 +1577,59 @@ const AdminPage: React.FC = () => {
                     </div>
                   </div>
                 ))
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* =============================== */}
+      {/*      Error Log 모달 창          */}
+      {/* =============================== */}
+      {showErrorLogModal && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60">
+          <div className="bg-gray-900 w-[90vw] max-w-4xl max-h-[80vh] rounded-lg border border-gray-700 flex flex-col">
+            <div className="flex items-center justify-between px-4 py-3 border-b border-gray-700">
+              <h3 className="text-lg font-semibold text-red-400">
+                현재 세션 에러 로그
+              </h3>
+              <button
+                onClick={() => setShowErrorLogModal(false)}
+                className="text-gray-400 hover:text-white"
+              >
+                ✕
+              </button>
+            </div>
+            <div className="flex-1 overflow-auto p-4">
+              {currentErrors.length === 0 ? (
+                <p className="text-gray-400 text-center py-10">
+                  현재 세션에서 발생한 에러가 없습니다.
+                </p>
+              ) : (
+                <table className="w-full text-left text-xs text-gray-300">
+                  <thead className="text-gray-500 border-b border-gray-700 bg-gray-800">
+                    <tr>
+                      <th className="p-2">Time</th>
+                      <th className="p-2">Component</th>
+                      <th className="p-2">Symbol</th>
+                      <th className="p-2">Interval</th>
+                      <th className="p-2">Message</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {currentErrors.map((err) => (
+                      <tr key={err.id} className="border-b border-gray-800 hover:bg-gray-800/50">
+                        <td className="p-2 whitespace-nowrap">
+                          {new Date(err.occurred_at).toLocaleString()}
+                        </td>
+                        <td className="p-2">{err.component}</td>
+                        <td className="p-2">{err.symbol || "-"}</td>
+                        <td className="p-2">{err.interval || "-"}</td>
+                        <td className="p-2 text-red-300">{err.error_message}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
               )}
             </div>
           </div>
