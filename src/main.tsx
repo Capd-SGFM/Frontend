@@ -5,7 +5,7 @@ import { BrowserRouter, Routes, Route } from "react-router-dom";
 import App from "./App";
 import MainPage from "./pages/MainPage";
 import AdminPage from "./pages/AdminPage";
-import BacktestingPage from "./pages/Backtesting";
+import BacktestingPage from "./pages/backtesting";
 import SignupPage from "./pages/SignupPage";
 import ProtectedRoute from "./components/ProtectedRoute";
 import "./index.css";
