@@ -10,6 +10,12 @@ export function useAuthCheck() {
   const [isValid, setIsValid] = useState(false);
   const navigate = useNavigate();
 
+  const [userData, setUserData] = useState<{
+    email: string;
+    google_id: string;
+    name: string;
+  } | null>(null);
+
   useEffect(() => {
     const token = localStorage.getItem("jwt_token");
     if (!token) {
@@ -22,8 +28,9 @@ export function useAuthCheck() {
       .get(`${BACKEND_BASE_URL}/auth/me`, {
         headers: { Authorization: `Bearer ${token}` },
       })
-      .then(() => {
+      .then((res) => {
         setIsValid(true);
+        setUserData(res.data);
       })
       .catch((err) => {
         console.warn("토큰 검증 실패:", err);
@@ -33,5 +40,5 @@ export function useAuthCheck() {
       .finally(() => setIsChecking(false));
   }, [navigate]);
 
-  return { isChecking, isValid };
+  return { isChecking, isValid, userData };
 }

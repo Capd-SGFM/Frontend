@@ -10,6 +10,11 @@ import SignupPage from "./pages/SignupPage";
 import ProtectedRoute from "./components/ProtectedRoute";
 import "./index.css";
 
+// --- TEMPORARY TEST PAGE START ---
+// 나중에 test.tsx 삭제 시 이 부분도 함께 삭제해주세요.
+import TradingMockup from "./test";
+// --- TEMPORARY TEST PAGE END ---
+
 ReactDOM.createRoot(document.getElementById("root")!).render(
   <React.StrictMode>
     <BrowserRouter>
@@ -36,6 +41,11 @@ ReactDOM.createRoot(document.getElementById("root")!).render(
             </div>
           }
         />
+
+        {/* --- TEMPORARY TEST PAGE START --- */}
+        {/* 나중에 test.tsx 삭제 시 이 부분도 함께 삭제해주세요. */}
+        <Route path="/test" element={<TradingMockup />} />
+        {/* --- TEMPORARY TEST PAGE END --- */}
       </Routes>
     </BrowserRouter>
   </React.StrictMode>

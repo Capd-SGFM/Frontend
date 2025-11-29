@@ -1,6 +1,8 @@
 import React, { useState, useRef, useEffect, useMemo } from "react";
+
 import axios from "axios";
 import { useAuthCheck } from "../components/is_logined";
+import { startCollection, stopCollection, getCollectionStatus, CollectionStatus } from "../api/paper_trading";
 
 type CeleryState =
   | "PENDING"
@@ -271,6 +273,11 @@ const AdminPage: React.FC = () => {
   // WebSocket 진행률
   const [websocketProgress, setWebsocketProgress] = useState<WebSocketSymbolState[]>([]);
   const [showWebsocketPanel, setShowWebsocketPanel] = useState(false);
+
+  // Paper Trading Dashboard
+  const [showPaperTradingDashboard, setShowPaperTradingDashboard] = useState(false);
+  const [paperStatus, setPaperStatus] = useState<CollectionStatus | null>(null);
+  const [paperLoading, setPaperLoading] = useState(false);
 
   // Error Log Modal
   const [showErrorLogModal, setShowErrorLogModal] = useState(false);
@@ -614,6 +621,53 @@ const AdminPage: React.FC = () => {
   }, [showWebsocketPanel]);
 
   /* ======================================
+   * Paper Trading Dashboard Polling
+   * ====================================== */
+  const fetchPaperStatus = async () => {
+    try {
+      const status = await getCollectionStatus();
+      setPaperStatus(status);
+    } catch (err) {
+      console.error("Paper Trading 상태 조회 실패:", err);
+    }
+  };
+
+  useEffect(() => {
+    if (!showPaperTradingDashboard) return;
+
+    void fetchPaperStatus();
+    const pollRef = setInterval(() => {
+      if (!document.hidden) void fetchPaperStatus();
+    }, 2000);
+
+    return () => clearInterval(pollRef);
+  }, [showPaperTradingDashboard]);
+
+  const handleStartPaperCollection = async () => {
+    setPaperLoading(true);
+    try {
+      await startCollection();
+      await fetchPaperStatus();
+    } catch (err: any) {
+      alert("수집 시작 실패: " + (err.message || ""));
+    } finally {
+      setPaperLoading(false);
+    }
+  };
+
+  const handleStopPaperCollection = async () => {
+    setPaperLoading(true);
+    try {
+      await stopCollection();
+      await fetchPaperStatus();
+    } catch (err: any) {
+      alert("수집 중지 실패: " + (err.message || ""));
+    } finally {
+      setPaperLoading(false);
+    }
+  };
+
+  /* ======================================
    * Error Log Polling
    * ====================================== */
   const fetchCurrentErrors = async () => {
@@ -887,11 +941,11 @@ const AdminPage: React.FC = () => {
 
           {/* 엔진 카드 4개 */}
           <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-3">
-            {renderEngineCard(
-              "WebSocket 실시간",
-              engineStatus.websocket,
-              () => setShowWebsocketPanel(true)
+            {renderEngineCard("WebSocket Engine", engineStatus.websocket, () =>
+              setShowWebsocketPanel(true)
             )}
+            
+
             {renderEngineCard(
               "Backfill 엔진",
               engineStatus.backfill,
@@ -927,6 +981,43 @@ const AdminPage: React.FC = () => {
           >
             {verifying ? "검증 중..." : "무결성 검증 시작"}
           </button>
+        </div>
+      </div>
+
+      {/* 4. Paper Trading */}
+      <div className="bg-gray-800 w-full max-w-5xl rounded-lg border border-gray-700 mt-6 mb-20">
+        <div className="p-6">
+          <div className="flex items-center justify-between mb-4">
+            <h2 className="text-lg font-semibold text-cyan-400">
+              4. Paper Trading
+            </h2>
+            <span className={`px-2 py-1 rounded-full border text-xs ${
+              paperStatus?.is_active 
+                ? "text-green-300 border-green-400" 
+                : "text-gray-300 border-gray-500"
+            }`}
+            >
+              {paperStatus?.is_active ? "RUNNING" : "STOPPED"}
+            </span>
+          </div>
+          
+          <p className="text-sm text-gray-400 mb-6">
+            가상 매매를 위한 실시간 데이터 수집 및 주문 처리 시스템을 관리합니다.
+            <br/>
+            현재 {paperStatus?.active_symbols.length || 0}개의 종목이 활성화되어 있습니다.
+          </p>
+
+          <div className="flex gap-4">
+            <button
+              onClick={() => setShowPaperTradingDashboard(true)}
+              className="px-4 py-2 rounded-md bg-cyan-600 hover:bg-cyan-500 font-semibold text-white shadow-lg shadow-cyan-900/20 flex items-center gap-2"
+            >
+              <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z" />
+              </svg>
+              Paper Trading 대시보드 열기
+            </button>
+          </div>
         </div>
       </div>
 
@@ -1631,6 +1722,118 @@ const AdminPage: React.FC = () => {
                   </tbody>
                 </table>
               )}
+            </div>
+          </div>
+        </div>
+      )}
+      {/* =========================================================
+       *  Paper Trading Dashboard Modal
+       * ========================================================= */}
+      {showPaperTradingDashboard && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 backdrop-blur-sm">
+          <div className="bg-[#1e222d] border border-gray-700 rounded-lg shadow-2xl w-[800px] h-[600px] flex flex-col overflow-hidden">
+            {/* Header */}
+            <div className="flex items-center justify-between px-6 py-4 border-b border-gray-700 bg-[#262b36]">
+              <h2 className="text-lg font-bold text-gray-100 flex items-center gap-2">
+                <span className="w-2 h-2 rounded-full bg-cyan-400 shadow-[0_0_8px_rgba(34,211,238,0.8)]"></span>
+                Paper Trading Dashboard
+              </h2>
+              <button
+                onClick={() => setShowPaperTradingDashboard(false)}
+                className="text-gray-400 hover:text-white transition-colors"
+              >
+                <svg
+                  className="w-6 h-6"
+                  fill="none"
+                  stroke="currentColor"
+                  viewBox="0 0 24 24"
+                >
+                  <path
+                    strokeLinecap="round"
+                    strokeLinejoin="round"
+                    strokeWidth={2}
+                    d="M6 18L18 6M6 6l12 12"
+                  />
+                </svg>
+              </button>
+            </div>
+
+            {/* Content */}
+            <div className="flex-1 p-6 overflow-y-auto">
+              {/* Control Panel */}
+              <div className="bg-gray-800/50 rounded-lg p-4 mb-6 border border-gray-700">
+                <div className="flex items-center justify-between mb-4">
+                  <h3 className="text-sm font-semibold text-gray-300">Global Control</h3>
+                  <div className="flex items-center gap-2">
+                    <span className={`w-2 h-2 rounded-full ${paperStatus?.is_active ? "bg-green-500 animate-pulse" : "bg-gray-500"}`}></span>
+                    <span className="text-xs text-gray-400">
+                      Status: <span className={paperStatus?.is_active ? "text-green-400" : "text-gray-400"}>{paperStatus?.is_active ? "Active" : "Inactive"}</span>
+                    </span>
+                  </div>
+                </div>
+                
+                <div className="flex gap-3">
+                  <button
+                    onClick={handleStartPaperCollection}
+                    disabled={paperLoading || paperStatus?.is_active}
+                    className={`flex-1 py-2 px-4 rounded font-medium transition-all ${
+                      paperStatus?.is_active
+                        ? "bg-gray-700 text-gray-500 cursor-not-allowed"
+                        : "bg-green-600 hover:bg-green-500 text-white shadow-lg shadow-green-900/20"
+                    }`}
+                  >
+                    {paperLoading ? "Processing..." : "Start Collection"}
+                  </button>
+                  <button
+                    onClick={handleStopPaperCollection}
+                    disabled={paperLoading || !paperStatus?.is_active}
+                    className={`flex-1 py-2 px-4 rounded font-medium transition-all ${
+                      !paperStatus?.is_active
+                        ? "bg-gray-700 text-gray-500 cursor-not-allowed"
+                        : "bg-red-600 hover:bg-red-500 text-white shadow-lg shadow-red-900/20"
+                    }`}
+                  >
+                    {paperLoading ? "Processing..." : "Stop Collection"}
+                  </button>
+                </div>
+              </div>
+
+              {/* Active Symbols List */}
+              <div className="bg-gray-800/30 rounded-lg border border-gray-700 overflow-hidden">
+                <div className="px-4 py-3 border-b border-gray-700 bg-gray-800/50 flex justify-between items-center">
+                  <h3 className="text-sm font-semibold text-gray-300">Active Symbols</h3>
+                  <span className="text-xs text-gray-500">Last Updated: {paperStatus?.last_updated ? new Date(paperStatus.last_updated).toLocaleTimeString() : "-"}</span>
+                </div>
+                
+                <div className="max-h-[300px] overflow-y-auto">
+                  {paperStatus?.active_symbols && paperStatus.active_symbols.length > 0 ? (
+                    <table className="w-full text-left text-xs">
+                      <thead className="bg-gray-800/80 text-gray-400 sticky top-0">
+                        <tr>
+                          <th className="px-4 py-2 font-medium">Symbol</th>
+                          <th className="px-4 py-2 font-medium">Status</th>
+                        </tr>
+                      </thead>
+                      <tbody className="divide-y divide-gray-700/50">
+                        {paperStatus.active_symbols.map((symbol) => (
+                          <tr key={symbol} className="hover:bg-gray-700/30 transition-colors">
+                            <td className="px-4 py-2 text-gray-200 font-medium">{symbol}</td>
+                            <td className="px-4 py-2">
+                              <span className="inline-flex items-center px-2 py-0.5 rounded text-[10px] font-medium bg-green-900/30 text-green-400 border border-green-500/30">
+                                Collecting
+                              </span>
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  ) : (
+                    <div className="p-8 text-center text-gray-500 text-sm">
+                      No active symbols. Start collection to begin.
+                    </div>
+                  )}
+                </div>
+              </div>
             </div>
           </div>
         </div>
