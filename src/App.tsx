@@ -49,7 +49,11 @@ const UserPlusIcon = (props: React.SVGProps<SVGSVGElement>) => (
 // --- Google 로그인 핸들러 ---
 function useGoogleLogin() {
   const handleGoogleLogin = () => {
-    const redirect_uri = `${BACKEND_BASE_URL}/auth/google/callback`;
+    // Construct absolute URL for redirect_uri
+    const redirect_uri = new URL(
+      `${BACKEND_BASE_URL}/auth/google/callback`,
+      window.location.origin
+    ).toString();
     const scope = encodeURIComponent(
       "openid email profile https://www.googleapis.com/auth/userinfo.email https://www.googleapis.com/auth/userinfo.profile"
     );

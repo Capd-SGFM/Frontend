@@ -8,6 +8,24 @@ export default defineConfig({
     port: 5173,
 
     proxy: {
+      '/api/orders': {
+        target: 'http://paper_trading:8003',
+        changeOrigin: true,
+        secure: false,
+        rewrite: (path) => path.replace(/^\/api/, '')
+      },
+      '/api/accounts': {
+        target: 'http://paper_trading:8003',
+        changeOrigin: true,
+        secure: false,
+        rewrite: (path) => path.replace(/^\/api/, '')
+      },
+      '/api/market': {
+        target: 'http://paper_trading:8003',
+        changeOrigin: true,
+        secure: false,
+        rewrite: (path) => path.replace(/^\/api/, '')
+      },
       '/api': {
         target: 'http://backend:8000',
         changeOrigin: true,
