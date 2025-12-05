@@ -38,7 +38,54 @@ export interface OrderRequest {
   price?: number;
   leverage?: number;
   google_id: string;
+  account_id?: number;
 }
+
+export interface Account {
+  id: number;
+  google_id: string;
+  account_name: string;
+  is_default: boolean;
+  total_balance: number;
+  available_balance: number;
+  margin_balance: number;
+  unrealized_pnl: number;
+  total_pnl: number;
+  created_at: string;
+}
+
+export interface Position {
+  id: number;
+  symbol: string;
+  position_side: string;
+  quantity: number;
+  entry_price: number;
+  leverage: number;
+  margin: number;
+  unrealized_pnl: number;
+  roe_percent: number;
+  liquidation_price: number | null;
+}
+
+export const createAccount = async (google_id: string, account_name: string, initial_balance: number) => {
+  const res = await paperApi.post<Account>("/accounts/", { google_id, account_name, initial_balance });
+  return res.data;
+};
+
+export const getAccounts = async (google_id: string) => {
+  const res = await paperApi.get<Account[]>(`/accounts/${google_id}`);
+  return res.data;
+};
+
+export const getPositions = async (account_id: number) => {
+  const res = await paperApi.get<Position[]>(`/accounts/${account_id}/positions`);
+  return res.data;
+};
+
+export const deleteAccount = async (account_id: number) => {
+  const res = await paperApi.delete(`/accounts/${account_id}`);
+  return res.data;
+};
 
 export const placeOrder = async (order: OrderRequest) => {
   const res = await paperApi.post("/orders/", order);
@@ -55,5 +102,19 @@ export interface LeverageBracket {
 
 export const getLeverageBrackets = async (symbol: string) => {
   const res = await paperApi.get<LeverageBracket[]>(`/market/leverage-brackets/${symbol}`);
+  return res.data;
+};
+
+export const getOrders = async (google_id: string, status?: string, account_id?: number) => {
+  const res = await paperApi.get<any[]>("/orders/", {
+    params: { google_id, status, account_id }
+  });
+  return res.data;
+};
+
+export const cancelOrder = async (order_id: number, google_id: string) => {
+  const res = await paperApi.delete(`/orders/${order_id}`, {
+    params: { google_id }
+  });
   return res.data;
 };
